@@ -1,0 +1,8 @@
+{
+  "computer": "1639b958-c8fd-4306-b1a4-2baee8fa02b9",
+  "machine_seq": 55500,
+  "commit": "c42377365788cc45305b2d245546b1aba6ab87bd",
+  "script_sha256": "9f64c9293189550ffa919836dbf009815f76061f20328d750a7b35242f267f5e",
+  "cw": "/path/to/cw-v2.1.0-x86_64-unknown-linux-musl/cw",
+  "topic": "general"
+}

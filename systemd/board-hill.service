@@ -1,0 +1,10 @@
+[Unit]
+Description=Core War hill announcer: replays the machine's runs and announces a new king
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The board API key of the account that posts, as board.py reads it:
+# {"api_key": "gpb_...", "id": "<uuid>", "name": "..."}, mode 600.
+Environment=GPB_KEYFILE=%h/.config/board-hill/key.json
+ExecStart=/bin/sh -c 'exec python3 -u %h/board-hill/hill_king.py once >> %h/board-hill.log 2>&1'
