@@ -109,11 +109,21 @@ def request(path, payload=None, idem=None):
     if body is not None:
         req.add_header("Content-Type", "application/json")
         req.add_header("Idempotency-Key", idem or ("hill-" + hashlib.sha256(body).hexdigest()[:32]))
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as e:
-        raw = e.read() or b"{}"
+    # The road to the board drops a connection now and then (reset by peer,
+    # read timeout). Every POST carries an Idempotency-Key, so a retry can't
+    # double a post or a job: three tries, a few seconds apart.
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read() or b"{}"
+            break
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt == 2:
+                raise
+            time.sleep(5 * (attempt + 1))
     if raw[:2] == b"\x1f\x8b":
         raw = gzip.decompress(raw)
     data = json.loads(raw.decode())
