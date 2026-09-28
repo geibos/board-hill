@@ -30,17 +30,21 @@ bash -lc читает общий ~/.profile. Повтор делает это н
   python3 hill_king.py replay FILE   проверить сохранённый вывод задания
   python3 hill_king.py accept FILE   проверить и принять в свою копию (без постов)
   python3 hill_king.py machine-run "CMD"   выполнить команду на машине от нашего имени
+  python3 hill_king.py publish       выложить свою копию для просмотрщика на зеркале
 
 Настройки — ~/.config/board-hill/config.json:
   {"computer": "<uuid поста машины>", "commit": "<коммит board-corewar>",
    "script_sha256": "<sha256 scripts/hill.sh на этом коммите>",
    "cw": "<путь к cw той же версии>", "topic": "general"}
-Состояние и своя копия хилла — ~/.local/state/board-hill/.
+Состояние и своя копия хилла — ~/.local/state/board-hill/. После каждого
+прохода, если своя копия изменилась, она же выкладывается в public/ рядом —
+её читает просмотрщик боёв на зеркале (publish).
 Ключ — как у board.py (GPB_KEYFILE); не печатается.
 """
 import base64
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -51,6 +55,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -59,6 +64,7 @@ import board  # noqa: E402
 
 CONFIG = os.path.expanduser(os.environ.get("HILL_CONFIG", "~/.config/board-hill/config.json"))
 STATE_DIR = os.path.expanduser(os.environ.get("HILL_STATE", "~/.local/state/board-hill"))
+PUBLIC = os.path.join(STATE_DIR, "public")
 REPORT = "----- cw-hill report -----"
 SNAPSHOT = "----- cw-hill snapshot (tar.gz, base64) -----"
 END = "----- cw-hill end -----"
@@ -439,6 +445,139 @@ def once(post=True):
     if st["sync"] and not busy and time.time() >= st.get("sync_after", 0):
         sync(cfg, st, hill, post)
         state_save(st)
+    refresh(cfg, hill)
+
+
+def described(cfg, path, rules):
+    """Имя и автор бойца, как их видит cw по правилам сезона."""
+    p = rules["params"]
+    out = run(cfg, ["list", "--json", "-s", str(p["core_size"]), "-c", str(p["cycles"]),
+                    "-p", str(p["processes"]), "-l", str(p["length"]), "-d", str(p["distance"]), path])
+    w = json.loads(out)["warrior"]
+    return {"name": w["name"], "author": w["author"], "length": w["length"]}
+
+
+def publish(cfg, hill, public=None):
+    """Выложить свою, повторённую копию хилла для просмотрщика на зеркале:
+    public/season<N>/hill.json (правила, состав, результаты всех матчей,
+    все бойцы сезона с именами), исходники в public/season<N>/warriors/ и
+    public/index.json — какие сезоны есть и за какой машиной каждый. Сезон
+    и машина — из config.json ("season", по умолчанию 1); прошлые сезоны
+    остаются, как были выложены. Каталог сезона подменяется целиком."""
+    public = os.path.expanduser(public or cfg.get("public") or PUBLIC)
+    season = int(cfg.get("season", 1))
+    name = "season%d" % season
+    dest = os.path.join(public, name)
+    os.makedirs(public, exist_ok=True)
+    os.chmod(public, 0o755)
+    with open(os.path.join(hill, "hill.toml"), "rb") as fh:
+        rules = tomllib.load(fh)
+    state = load(os.path.join(hill, "state.json"))
+    known = {}
+    try:
+        known = {w["id"]: w for w in load(os.path.join(dest, "hill.json"))["warriors"]}
+    except (OSError, ValueError, KeyError):
+        pass
+    tmp = tempfile.mkdtemp(prefix=".%s-" % name, dir=public)
+    try:
+        os.chmod(tmp, 0o755)
+        os.makedirs(os.path.join(tmp, "warriors"), mode=0o755)
+        warriors = []
+        for f in sorted(os.listdir(os.path.join(hill, "warriors"))):
+            if not re.fullmatch(r"[0-9a-f]{16}\.red", f):
+                continue
+            src = os.path.join(hill, "warriors", f)
+            shutil.copyfile(src, os.path.join(tmp, "warriors", f))
+            os.chmod(os.path.join(tmp, "warriors", f), 0o644)
+            w = known.get(f[:-4])
+            if w is None:
+                try:
+                    w = dict(id=f[:-4], **described(cfg, src, rules))
+                except (ValueError, KeyError, json.JSONDecodeError):
+                    w = {"id": f[:-4], "name": None, "author": None, "length": None}
+            warriors.append(w)
+        doc = {
+            "season": season,
+            "computer": cfg["computer"],
+            "machine_seq": cfg.get("machine_seq"),
+            "updated_at": int(time.time()),
+            "rules": rules,
+            "next": state["next"],
+            "members": state["members"],
+            "results": load(os.path.join(hill, "results.json"))["matches"],
+            "warriors": warriors,
+        }
+        with open(os.path.join(tmp, "hill.json"), "w") as fh:
+            json.dump(doc, fh, ensure_ascii=False, separators=(",", ":"))
+        os.chmod(os.path.join(tmp, "hill.json"), 0o644)
+        old = None
+        if os.path.exists(dest):
+            old = tempfile.mkdtemp(prefix=".old-", dir=public)
+            os.rename(dest, os.path.join(old, name))
+        try:
+            os.rename(tmp, dest)
+        except OSError:
+            # The season that was stays published.
+            if old:
+                os.rename(os.path.join(old, name), dest)
+                os.rmdir(old)
+            raise
+        tmp = None
+        if old:
+            shutil.rmtree(old)
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    index = os.path.join(public, "index.json")
+    try:
+        seasons = [s for s in load(index)["seasons"] if s.get("season") != season]
+    except (OSError, ValueError, KeyError):
+        seasons = []
+    king = state["members"][0] if state["members"] else None
+    seasons.append({
+        "season": season,
+        "computer": cfg["computer"],
+        "machine_seq": cfg.get("machine_seq"),
+        "path": name + "/",
+        "updated_at": doc["updated_at"],
+        "members": len(state["members"]),
+        "king": king and {k: king[k] for k in ("id", "name", "author")},
+    })
+    seasons.sort(key=lambda s: s["season"])
+    fd, part = tempfile.mkstemp(prefix=".index-", dir=public)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"seasons": seasons}, fh, ensure_ascii=False, separators=(",", ":"))
+    os.chmod(part, 0o644)
+    os.replace(part, index)
+
+
+def refresh(cfg, hill):
+    """publish, если своя копия изменилась с последней выкладки. Сбой выкладки
+    не мешает анонсеру: только строка в лог."""
+    if not os.path.exists(os.path.join(hill, "state.json")):
+        return
+    h = hashlib.sha256()
+    for f in ("hill.toml", "state.json", "results.json"):
+        with open(os.path.join(hill, f), "rb") as fh:
+            h.update(fh.read())
+    h.update("\n".join(sorted(os.listdir(os.path.join(hill, "warriors")))).encode())
+    h.update(json.dumps([cfg.get("season", 1), cfg["computer"], cfg.get("machine_seq")]).encode())
+    mark = os.path.join(STATE_DIR, "published")
+    key = h.hexdigest()
+    try:
+        with open(mark) as fh:
+            if fh.read().strip() == key:
+                return
+    except OSError:
+        pass
+    try:
+        publish(cfg, hill)
+    except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError) as e:
+        print("выкладка для зеркала не удалась:", e)
+        return
+    with open(mark, "w") as fh:
+        fh.write(key + "\n")
+    print("выложено для зеркала:", key[:16])
 
 
 def status():
@@ -492,14 +631,17 @@ def machine_job(command, timeout=900):
     finally:
         # Stop first, then release. Released first, the machine keeps running
         # until the idle watchdog, and only its holder, creator or operator may
-        # stop it. A stop the board refuses (a job still running) must not keep
-        # control: that job is left to the watchdog, as before.
+        # stop it. A stop that fails in any way (the board refuses it while a
+        # job runs, the answer is cut off or is not JSON) must not keep
+        # control: the machine is then left to the watchdog, as before.
         try:
-            request(base + "/lifecycle", {"action": "stop"}, idem="hill-stop-" + os.urandom(8).hex())
-        except (board.BoardError, urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            print("машина не остановлена:", e)
-        request(base + "/control", {"action": "release", "generation": gen},
-                idem="hill-rel-" + os.urandom(8).hex())
+            try:
+                request(base + "/lifecycle", {"action": "stop"}, idem="hill-stop-" + os.urandom(8).hex())
+            except (board.BoardError, OSError, ValueError, http.client.HTTPException) as e:
+                print("машина не остановлена:", e)
+        finally:
+            request(base + "/control", {"action": "release", "generation": gen},
+                    idem="hill-rel-" + os.urandom(8).hex())
 
 
 def machine_run(command):
@@ -522,6 +664,8 @@ def main():
         state_save(st)
     elif cmd == "status":
         status()
+    elif cmd == "publish":
+        publish(config(), os.path.join(STATE_DIR, "hill"))
     elif cmd in ("replay", "accept") and len(sys.argv) == 3:
         hill = os.path.join(STATE_DIR, "hill")
         copy, report = replay(config(), open(sys.argv[2]).read(), hill)

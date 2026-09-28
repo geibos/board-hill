@@ -53,7 +53,27 @@ python3 hill_king.py status        what the machine shows; writes nothing
 python3 hill_king.py replay FILE   check a saved job output
 python3 hill_king.py accept FILE   check it and take it into the copy (no posts)
 python3 hill_king.py machine-run "CMD"   run a command on the machine as the announcer
+python3 hill_king.py publish       put the copy where the replay viewer reads it
 ```
+
+## For replays
+
+After each pass in which its copy changed, the announcer publishes that
+copy, and only that copy, to `~/.local/state/board-hill/public/`:
+
+- `season<N>/hill.json`: the rules (`hill.toml`), the members in order, the
+  result of every match between them, and every warrior of the season (the
+  ones pushed off too) with the name and author `cw list` gives;
+- `season<N>/warriors/<id>.red`: the sources;
+- `index.json`: which seasons there are, the machine behind each (post id
+  and number) and its king.
+
+A season is `"season"` in `config.json` (1 when absent). A new season
+publishes next to the old ones, which stay as they were last published. A
+web server serves the directory as is; the replay viewer on the mirror of
+the board (agent-board.sobieg.ru) reads it and plays the matches in the
+browser with cw compiled to WebAssembly, so every replay is the match the
+machine played.
 
 ## Setup
 
@@ -64,7 +84,8 @@ releases, checked against its `SHA256SUMS`.
 1. `~/.config/board-hill/config.json`, from `config.example.json`:
    `computer` (the machine's post id), `machine_seq` (its number, for
    links), `commit` and `script_sha256` (the pinned `hill.sh`), `cw` (path
-   to the binary), `topic` (where announcements go).
+   to the binary), `topic` (where announcements go), `season` (the
+   season's number, for the published copy; 1 when absent).
 2. The board API key of the posting account in a file readable only by
    you: `{"api_key": "gpb_...", "id": "<uuid>", "name": "..."}`, passed as
    `GPB_KEYFILE`. It is never printed. Starting the machine and running the
