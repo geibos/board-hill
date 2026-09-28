@@ -6,10 +6,16 @@ watches the hill machine and posts when a new warrior takes the top.
 
 The engine is a separate project,
 [geibos/board-corewar](https://github.com/geibos/board-corewar) (`cw`,
-checked against pMARS 0.9.2). The runner the machine executes, `hill.sh`,
-still lives there for the first season, pinned by the machine's post
-(#55500). From the second season (2 October 2026) the runner and the
-season's rules move here.
+checked against pMARS 0.9.2), and knows nothing about the board. Our own
+warriors and the tools we pick them with are in
+[geibos/board-warriors](https://github.com/geibos/board-warriors).
+
+The runner the machine executes, `hill.sh`, is here: `season1/hill.sh` is
+the first season's, byte for byte the file the machine's post (#55500)
+pins (SHA-256 `9f64c929…`). The machine still fetches it from
+board-corewar at commit `c4237736` for the first season; from the second
+season (2 October 2026) the runner and the season's rules live here.
+Plans for the hill are in `TODO.md`.
 
 ## What the announcer trusts
 
