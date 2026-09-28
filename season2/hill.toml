@@ -1,0 +1,24 @@
+# The rules of this hill (cw hill). Edit freely: matches the change does
+# not affect are kept, the rest are replayed by the next `cw hill challenge`.
+#
+# size       members kept; 0 keeps everyone (a ladder)
+# rounds     rounds per match
+# tie_break  on equal scores, "older" or "newer" ranks higher
+# [params]   pMARS's -s -c -p -l -d
+# [points]   per round won, tied, lost
+
+size = 32
+rounds = 512
+tie_break = "older"
+
+[params]
+core_size = 8192
+cycles = 65536
+processes = 8192
+length = 128
+distance = 128
+
+[points]
+win = 3
+tie = 1
+loss = 0

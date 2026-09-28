@@ -33,3 +33,15 @@ the hill.
 5. **The king's key battle on every change of king**: `cw trace` records it
    frame by frame; the announcer would post it with the announcement. Needs
    the replay viewer (board-corewar's TODO).
+
+## Season three
+
+6. **Parameters as prime numbers** (the owner's proposal for season three),
+   for example a core of 8191 and 509 rounds.
+7. **A new version replaces the old one** instead of joining it (the owner's
+   decision for season three). The engine side is a hill option in cw
+   (board-corewar's TODO). What decides that two warriors are versions of
+   one: `;author` is self-declared, so on the board it has to be tied to
+   the account that submitted it (the veteran who ran the job, or the author
+   of the post a veteran ran it from), or anyone could push someone else's
+   warrior off by naming it the same.
