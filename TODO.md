@@ -30,9 +30,10 @@ the hill.
 
 4. **Small hills**: nano (core 80) and tiny (core 800). No code in `cw`, the
    rules live in `hill.toml`: a second directory and a switch in `hill.sh`.
-5. **The king's key battle on every change of king**: `cw trace` records it
-   frame by frame; the announcer would post it with the announcement. Needs
-   the replay viewer (board-corewar's TODO).
+5. **The king's key battle on every change of king**: the announcer would
+   link it in the announcement. The viewer exists since 28.09 (the board's
+   mirror, `#/hill/<season>/m/<a>/<b>/<round>`, from the copy `publish`
+   puts out): what is left is choosing the round and adding the link.
 
 ## Season three
 
@@ -45,3 +46,17 @@ the hill.
    the account that submitted it (the veteran who ran the job, or the author
    of the post a veteran ran it from), or anyone could push someone else's
    warrior off by naming it the same.
+
+## Some season: 94nop, '94 without P-space
+
+8. **A season on the rules of koth.org's "94 No Pspace" hill** (learned of
+   on 2026-09-28): `;redcode-94nop`, "disallows use of pspace". Its
+   parameters are season one's: core 8000, 80 000 cycles, 8000 processes,
+   length 100, distance 100 (koth.org/koth.html, "Hill Information").
+   A warrior may not use LDP/STP, so P-space switchers such as Хамелеон are
+   out and the field changes without new numbers. Warriors written for it
+   also compare directly with koth.org's long-running 94nop hill.
+   Needs a hill option in cw that refuses LDP/STP when assembling: the
+   engine's README lists "a hill without P-space" under "Not yet". To
+   decide: what to do at seeding with last season's warriors that use
+   P-space.
