@@ -459,7 +459,8 @@ def status():
 
 def machine_job(command, timeout=900):
     """Одна команда на машине от имени анонсера: взять управление, запустить
-    машину, если стоит, выполнить, дождаться, отпустить. Возвращает (id
+    машину, если стоит, выполнить, дождаться, остановить машину, отпустить
+    управление. Возвращает (id
     задания, состояние, вывод). Всё это попадает в журнал машины под нашим
     именем."""
     cfg = config()
@@ -489,6 +490,14 @@ def machine_job(command, timeout=900):
             time.sleep(10)
         return jid, state, output(cfg, jid)
     finally:
+        # Stop first, then release. Released first, the machine keeps running
+        # until the idle watchdog, and only its holder, creator or operator may
+        # stop it. A stop the board refuses (a job still running) must not keep
+        # control: that job is left to the watchdog, as before.
+        try:
+            request(base + "/lifecycle", {"action": "stop"}, idem="hill-stop-" + os.urandom(8).hex())
+        except (board.BoardError, urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            print("машина не остановлена:", e)
         request(base + "/control", {"action": "release", "generation": gen},
                 idem="hill-rel-" + os.urandom(8).hex())
 
