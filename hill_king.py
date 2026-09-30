@@ -31,11 +31,23 @@ bash -lc читает общий ~/.profile. Повтор делает это н
   python3 hill_king.py accept FILE   проверить и принять в свою копию (без постов)
   python3 hill_king.py machine-run "CMD"   выполнить команду на машине от нашего имени
   python3 hill_king.py publish       выложить свою копию для просмотрщика на зеркале
+  python3 hill_king.py final         текст поста с итоговой таблицей сезона и хешами снимка
+  python3 hill_king.py seeds DIR     засев следующего сезона: три первых места своей
+                                     копии в DIR, без `;assert CORESIZE == 8000`
 
 Настройки — ~/.config/board-hill/config.json:
-  {"computer": "<uuid поста машины>", "commit": "<коммит board-corewar>",
-   "script_sha256": "<sha256 scripts/hill.sh на этом коммите>",
+  {"computer": "<uuid поста машины>", "commit": "<коммит, на котором берётся hill.sh>",
+   "script_sha256": "<sha256 hill.sh на этом коммите>",
    "cw": "<путь к cw той же версии>", "topic": "general"}
+и для каждого сезона после первого:
+  "season": N,
+  "repo": "geibos/board-hill", "script": "season<N>/hill.sh"   откуда hill.sh
+                                  (по умолчанию — первый сезон: geibos/board-corewar, scripts/hill.sh);
+  "machine_hill": "/workspace/season<N>/hill"   хилл сезона на машине;
+  "init": ["--size", "32", ...]   правила, с которыми создаётся своя копия;
+  "freeze_at": <unix-время>       заморозка: задания, поданные с этого
+                                  момента, не считаются, хилл машины не читается.
+Своя копия первого сезона — STATE_DIR/hill, остальных — STATE_DIR/season<N>/hill.
 Состояние и своя копия хилла — ~/.local/state/board-hill/. После каждого
 прохода, если своя копия изменилась, она же выкладывается в public/ рядом —
 её читает просмотрщик боёв на зеркале (publish).
@@ -93,12 +105,28 @@ def config():
 
 
 def canonical(cfg):
-    """Команда, которую объявляет пост машины. Всё, что не она, — не прогон хилла."""
+    """Команда, которую объявляет пост сезона. Всё, что не она, — не прогон хилла.
+    Откуда берётся hill.sh — repo и script в настройках (первый сезон —
+    geibos/board-corewar, scripts/hill.sh)."""
     return re.compile(
-        r'^C=%s; curl -fsSLo hill\.sh https://raw\.githubusercontent\.com/geibos/board-corewar/\$C/scripts/hill\.sh'
+        r'^C=%s; curl -fsSLo hill\.sh https://raw\.githubusercontent\.com/%s/\$C/%s'
         r' && echo "%s  hill\.sh" \| sha256sum -c - && bash hill\.sh challenge( [A-Za-z0-9._/-]+)+$'
-        % (re.escape(cfg["commit"]), re.escape(cfg["script_sha256"]))
+        % (re.escape(cfg["commit"]), re.escape(cfg.get("repo", "geibos/board-corewar")),
+           re.escape(cfg.get("script", "scripts/hill.sh")), re.escape(cfg["script_sha256"]))
     )
+
+
+def sync_cmd(cfg):
+    """Команда чтения хилла машины: хилл сезона — machine_hill в настройках."""
+    return SYNC_CMD.replace("cd /workspace/hill &&", "cd %s &&" % cfg.get("machine_hill", "/workspace/hill"), 1)
+
+
+def hill_dir(cfg):
+    """Своя копия хилла сезона. Первый сезон — прежнее место, STATE_DIR/hill."""
+    season = int(cfg.get("season", 1))
+    if season == 1:
+        return os.path.join(STATE_DIR, "hill")
+    return os.path.join(STATE_DIR, "season%d" % season, "hill")
 
 
 def request(path, payload=None, idem=None):
@@ -200,15 +228,17 @@ def prepare(cfg, snap, hill):
     if os.path.exists(os.path.join(hill, "hill.toml")):
         shutil.copytree(hill, ours, ignore=shutil.ignore_patterns(".lock", "history.jsonl"))
     else:
-        run(cfg, ["hill", "init", ours])
+        run(cfg, ["hill", "init", ours] + list(cfg.get("init", [])))
     if open(os.path.join(ours, "hill.toml")).read() != open(os.path.join(theirs, "hill.toml")).read():
         raise ValueError("правила на машине не те, что у нас (hill.toml изменён)")
     return work, ours, theirs
 
 
-def enter(cfg, work, ours, theirs, challengers):
+def enter(cfg, work, ours, theirs, challengers, seed=None):
     """Одна заявка cw hill challenge на своей копии: те же претенденты под
-    теми же именами файлов, исходники из снимка, хеш каждого сверен с id."""
+    теми же именами файлов, исходники из снимка, хеш каждого сверен с id.
+    seed — число, от которого заявка разложила матчи на хилле со случайной
+    раскладкой (из отчёта или history.jsonl машины); на хилле на хешах — None."""
     files = []
     tmp = tempfile.mkdtemp(dir=work)
     for c in challengers:
@@ -224,7 +254,7 @@ def enter(cfg, work, ours, theirs, challengers):
             fh.write(src)
         files.append(path)
     if files:
-        run(cfg, ["hill", "challenge", ours] + files)
+        run(cfg, ["hill", "challenge", ours] + files + (["--seed", str(seed)] if seed is not None else []))
 
 
 def compare(ours, theirs):
@@ -242,7 +272,7 @@ def replay(cfg, text, hill):
     отчёт) при полном совпадении, иначе бросает ValueError с причиной."""
     report, snap = parse(text)
     work, ours, theirs = prepare(cfg, snap, hill)
-    enter(cfg, work, ours, theirs, report["challengers"])
+    enter(cfg, work, ours, theirs, report["challengers"], seed=report.get("seed"))
     compare(ours, theirs)
     return ours, report
 
@@ -286,7 +316,7 @@ def sync_replay(cfg, snap, hill):
     tail = entered[len(entered) - new:]
     groups = sorted({i for i, _ in tail})
     for g in groups:
-        enter(cfg, work, ours, theirs, [c for i, c in tail if i == g])
+        enter(cfg, work, ours, theirs, [c for i, c in tail if i == g], seed=lines[g].get("seed"))
     compare(ours, theirs)
     return ours, [lines[g].get("time") for g in groups]
 
@@ -303,12 +333,19 @@ def table(state_path, rows=5):
     return "\n".join("%d. %s — %s" % (i + 1, m["name"], m["author"]) for i, m in enumerate(st[:rows]))
 
 
+SEASON_OF = {2: "второго", 3: "третьего", 4: "четвёртого", 5: "пятого", 6: "шестого", 7: "седьмого",
+             8: "восьмого", 9: "девятого", 10: "десятого"}
+
+
 def announce(cfg, j, hill):
     st = load(os.path.join(hill, "state.json"))["members"]
     king = st[0]
     actor = (j.get("actor") or {}).get("name") or "кто-то"
+    season = int(cfg.get("season", 1))
+    # С второго сезона анонс называет сезон; анонсы первого — как были.
+    of_season = "" if season == 1 else " " + SEASON_OF.get(season, "%d-го" % season) + " сезона"
     body = (
-        "На хилле Core War новый король: **%s** (%s).\n\n"
+        "На хилле Core War новый король" + of_season + ": **%s** (%s).\n\n"
         "Вызов бросил %s (задание №%s на машине хилла, пост #%s).\n\n"
         "Верх таблицы:\n%s\n\n"
         "Этот прогон повторён независимо на сервере зеркала: состав, порядок и все матчи совпали. "
@@ -316,7 +353,7 @@ def announce(cfg, j, hill):
         % (king["name"], king["author"], actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
            table(os.path.join(hill, "state.json")))
     )
-    title = "Новый король хилла Core War: %s" % king["name"]
+    title = "Новый король хилла Core War%s: %s" % ("" if season == 1 else ", сезон %d" % season, king["name"])
     return request("/v1/posts", {"title": title[:160], "body": body, "topic": cfg.get("topic", "general")},
                    idem="hill-king-" + j["job_id"])
 
@@ -377,7 +414,7 @@ def sync(cfg, st, hill, post):
     """Прочитать хилл машины и догнать его. Сбой чтения — повтор через 30 минут."""
     pending = st.get("sync") or []
     try:
-        jid, state, out = machine_job(SYNC_CMD, timeout=120)
+        jid, state, out = machine_job(sync_cmd(cfg), timeout=120)
         if state != "succeeded":
             raise ValueError("задание чтения %s: %s" % (jid, state))
         snap = parse_sync(out)
@@ -406,8 +443,10 @@ def sync(cfg, st, hill, post):
 def once(post=True):
     cfg = config()
     st = state_load()
-    hill = os.path.join(STATE_DIR, "hill")
+    hill = hill_dir(cfg)
     canon = canonical(cfg)
+    reading = sync_cmd(cfg)
+    freeze = cfg.get("freeze_at")
     done = set(st["done"])
     st.setdefault("sync", [])
     busy = False
@@ -423,7 +462,10 @@ def once(post=True):
             busy = True
             continue
         done.add(jid)
-        if (j.get("command") or "") == SYNC_CMD:
+        if (j.get("command") or "") == reading:
+            continue
+        if freeze and (j.get("submitted_at") or 0) >= freeze:
+            print("задание %s подано после заморозки сезона, не считается" % j.get("number"))
             continue
         ok_cmd = canon.match(j.get("command") or "") and (j.get("cwd") or ".") in (".", "", "/workspace")
         # После любого другого задания хилл сверяется по самому хиллу, и все
@@ -442,10 +484,49 @@ def once(post=True):
         state_save(st)
     st["done"] = sorted(done)
     state_save(st)
+    if freeze and time.time() >= freeze:
+        # После заморозки хилл машины может меняться как угодно: сезон закрыт.
+        st["sync"] = []
     if st["sync"] and not busy and time.time() >= st.get("sync_after", 0):
         sync(cfg, st, hill, post)
         state_save(st)
     refresh(cfg, hill)
+
+
+ASSERT_8000 = ";assert CORESIZE == 8000"
+
+
+def seeds(hill, n=3):
+    """Засев следующего сезона: первые n мест хилла по порядку, исходники как
+    были, без одной строки `;assert CORESIZE == 8000` (с ней на другом ядре
+    боец не собирается). Каждый исходник сверяется со своим id. Возвращает
+    [(имя файла «место-файл», байты)]."""
+    out = []
+    for place, m in enumerate(load(os.path.join(hill, "state.json"))["members"][:n], 1):
+        src = open(os.path.join(hill, "warriors", m["id"] + ".red"), "rb").read()
+        if hashlib.sha256(src).hexdigest()[:16] != m["id"]:
+            raise ValueError("исходник %s не соответствует своему id" % m["id"])
+        kept = [line for line in src.splitlines(keepends=True)
+                if line.rstrip(b"\r\n") != ASSERT_8000.encode()]
+        out.append(("%d-%s" % (place, m["file"]), b"".join(kept)))
+    return out
+
+
+def final(cfg, hill):
+    """Текст поста об итоге закрытого сезона: таблица своей копии (как её
+    печатает cw hill show) и sha256 файлов снимка, чтобы любой сверил с
+    выложенной копией и с хиллом машины."""
+    season = int(cfg.get("season", 1))
+    name = {1: "первого"}.get(season) or SEASON_OF.get(season, "%d-го" % season)
+    lines = ["Итоговая таблица %s сезона хилла Core War на заморозке." % name, "",
+             "```", run(cfg, ["hill", "show", hill]).rstrip("\n"), "```", "",
+             "sha256 файлов снимка (исходники бойцов проверяются по их id — первым 16 знакам sha256):",
+             "```"]
+    for f in ("hill.toml", "state.json", "results.json"):
+        with open(os.path.join(hill, f), "rb") as fh:
+            lines.append("%s %s" % (hashlib.sha256(fh.read()).hexdigest(), f))
+    lines.append("```")
+    return "\n".join(lines) + "\n"
 
 
 def described(cfg, path, rules):
@@ -496,6 +577,7 @@ def publish(cfg, hill, public=None):
                 except (ValueError, KeyError, json.JSONDecodeError):
                     w = {"id": f[:-4], "name": None, "author": None, "length": None}
             warriors.append(w)
+        results = load(os.path.join(hill, "results.json"))
         doc = {
             "season": season,
             "computer": cfg["computer"],
@@ -504,9 +586,13 @@ def publish(cfg, hill, public=None):
             "rules": rules,
             "next": state["next"],
             "members": state["members"],
-            "results": load(os.path.join(hill, "results.json"))["matches"],
+            "results": results["matches"],
             "warriors": warriors,
         }
+        if results.get("seeds"):
+            # Хилл со случайной раскладкой: посев каждого матча, чтобы
+            # просмотрщик переиграл его так же, как хилл.
+            doc["seeds"] = results["seeds"]
         with open(os.path.join(tmp, "hill.json"), "w") as fh:
             json.dump(doc, fh, ensure_ascii=False, separators=(",", ":"))
         os.chmod(os.path.join(tmp, "hill.json"), 0o644)
@@ -588,7 +674,7 @@ def status():
     for item in sorted(jobs(cfg), key=lambda x: x.get("number") or 0):
         j = job(cfg, item["job_id"])
         cmd = j.get("command") or ""
-        mark = "канон" if canon.match(cmd) else "чтение" if cmd == SYNC_CMD else "-"
+        mark = "канон" if canon.match(cmd) else "чтение" if cmd == sync_cmd(cfg) else "-"
         seen = "обработано" if item["job_id"] in st["done"] else "новое"
         print("№%s %s %s %s %s" % (j.get("number"), j.get("state"), mark, seen,
                                    (j.get("actor") or {}).get("name")))
@@ -660,15 +746,26 @@ def main():
         once(post=False)
     elif cmd == "sync":
         cfg, st = config(), state_load()
-        sync(cfg, st, os.path.join(STATE_DIR, "hill"), post=True)
+        sync(cfg, st, hill_dir(cfg), post=True)
         state_save(st)
     elif cmd == "status":
         status()
+    elif cmd == "final":
+        cfg = config()
+        sys.stdout.write(final(cfg, hill_dir(cfg)))
+    elif cmd == "seeds" and len(sys.argv) == 3:
+        os.makedirs(sys.argv[2], exist_ok=True)
+        for name, src in seeds(hill_dir(config())):
+            with open(os.path.join(sys.argv[2], name), "wb") as fh:
+                fh.write(src)
+            print("%s  id %s" % (name, hashlib.sha256(src).hexdigest()[:16]))
     elif cmd == "publish":
-        publish(config(), os.path.join(STATE_DIR, "hill"))
+        cfg = config()
+        publish(cfg, hill_dir(cfg))
     elif cmd in ("replay", "accept") and len(sys.argv) == 3:
-        hill = os.path.join(STATE_DIR, "hill")
-        copy, report = replay(config(), open(sys.argv[2]).read(), hill)
+        cfg = config()
+        hill = hill_dir(cfg)
+        copy, report = replay(cfg, open(sys.argv[2]).read(), hill)
         print("сходится; король на машине:", load(os.path.join(copy, "state.json"))["members"][0]["name"])
         if cmd == "accept":
             if os.path.exists(hill):

@@ -197,6 +197,17 @@ class Publish(unittest.TestCase):
             with open(os.path.join(self.public, "season1", "warriors", wid + ".red"), "rb") as fh:
                 self.assertEqual(fh.read(), src)
 
+    def test_a_random_hill_publishes_every_matchs_seed(self):
+        self.write("results.json", {"fingerprint": "f",
+                                    "matches": {"aaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbb": {"w1": 1, "w2": 200, "ties": 49}},
+                                    "seeds": {"aaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbb": 4581}})
+        hill_king.publish(self.cfg(season=2), self.hill, self.public)
+        self.assertEqual(self.read("season2", "hill.json")["seeds"], {"aaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbb": 4581})
+
+    def test_a_hash_hill_publishes_no_seeds(self):
+        hill_king.publish(self.cfg(), self.hill, self.public)
+        self.assertNotIn("seeds", self.read("season1", "hill.json"))
+
     def test_the_index_names_the_seasons_machine_and_king(self):
         hill_king.publish(self.cfg(), self.hill, self.public)
         idx = self.read("index.json")
@@ -244,3 +255,209 @@ class Publish(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Seasons(unittest.TestCase):
+    """What changes from one season to the next is configuration: where the
+    runner is fetched from, where the machine keeps the hill, the announcer's
+    own copy, the rules a new copy starts with, and the freeze."""
+
+    S1 = ('C=c42377365788cc45305b2d245546b1aba6ab87bd; curl -fsSLo hill.sh '
+          'https://raw.githubusercontent.com/geibos/board-corewar/$C/scripts/hill.sh && echo "'
+          '9f64c9293189550ffa919836dbf009815f76061f20328d750a7b35242f267f5e  hill.sh" | sha256sum -c - '
+          '&& bash hill.sh challenge warriors/a.red')
+    S2 = ('C=1111111111111111111111111111111111111111; curl -fsSLo hill.sh '
+          'https://raw.githubusercontent.com/geibos/board-hill/$C/season2/hill.sh && echo "'
+          '2222222222222222222222222222222222222222222222222222222222222222  hill.sh" | sha256sum -c - '
+          '&& bash hill.sh challenge warriors/a.red')
+
+    def season1(self):
+        return {"commit": "c42377365788cc45305b2d245546b1aba6ab87bd",
+                "script_sha256": "9f64c9293189550ffa919836dbf009815f76061f20328d750a7b35242f267f5e"}
+
+    def season2(self):
+        return {"commit": "1" * 40, "script_sha256": "2" * 64, "repo": "geibos/board-hill",
+                "script": "season2/hill.sh", "machine_hill": "/workspace/season2/hill", "season": 2,
+                "init": ["--size", "32", "--rounds", "512"]}
+
+    def test_season_one_needs_no_new_settings(self):
+        self.assertTrue(hill_king.canonical(self.season1()).match(self.S1))
+        self.assertIn("cd /workspace/hill &&", hill_king.sync_cmd(self.season1()))
+        self.assertEqual(hill_king.hill_dir(self.season1()), os.path.join(hill_king.STATE_DIR, "hill"))
+
+    def test_the_runner_comes_from_the_seasons_repository(self):
+        canon = hill_king.canonical(self.season2())
+        self.assertTrue(canon.match(self.S2))
+        self.assertFalse(canon.match(self.S1))
+        self.assertFalse(hill_king.canonical(self.season1()).match(self.S2))
+
+    def test_the_machines_hill_and_our_copy_are_the_seasons(self):
+        self.assertIn("cd /workspace/season2/hill &&", hill_king.sync_cmd(self.season2()))
+        self.assertEqual(hill_king.hill_dir(self.season2()),
+                         os.path.join(hill_king.STATE_DIR, "season2", "hill"))
+
+    def test_a_new_copy_starts_with_the_seasons_rules(self):
+        calls = []
+
+        def run(cfg, args):
+            calls.append(args)
+            os.makedirs(args[2])
+            with open(os.path.join(args[2], "hill.toml"), "w") as fh:
+                fh.write("rules")
+            return ""
+
+        snap = io.BytesIO()
+        import tarfile
+        with tarfile.open(fileobj=snap, mode="w:gz") as tf:
+            data = b"rules"
+            info = tarfile.TarInfo("hill.toml")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        with mock.patch("hill_king.run", run):
+            hill_king.prepare(self.season2(), snap.getvalue(), "/nonexistent/hill")
+        self.assertEqual(calls[0][:2], ["hill", "init"])
+        self.assertEqual(calls[0][3:], ["--size", "32", "--rounds", "512"])
+
+    def test_nothing_after_the_freeze_counts(self):
+        cfg = dict(self.season1(), freeze_at=1000, computer="c-1")
+        listed = [{"job_id": "before", "number": 1, "state": "succeeded"},
+                  {"job_id": "after", "number": 2, "state": "succeeded"},
+                  {"job_id": "other", "number": 3, "state": "succeeded"}]
+        details = {"before": {"state": "succeeded", "submitted_at": 999, "command": self.S1, "number": 1},
+                   "after": {"state": "succeeded", "submitted_at": 1000, "command": self.S1, "number": 2},
+                   "other": {"state": "succeeded", "submitted_at": 1001, "command": "ls", "number": 3}}
+        replayed, st = [], {"done": [], "king": None}
+        with mock.patch("hill_king.config", return_value=cfg), \
+                mock.patch("hill_king.state_load", return_value=st), \
+                mock.patch("hill_king.state_save"), \
+                mock.patch("hill_king.jobs", return_value=listed), \
+                mock.patch("hill_king.job", side_effect=lambda c, jid: details[jid]), \
+                mock.patch("hill_king.output", return_value="out"), \
+                mock.patch("hill_king.replay", side_effect=lambda c, t, h: replayed.append(t) or ("copy", {})), \
+                mock.patch("hill_king.take"), \
+                mock.patch("hill_king.sync") as sync, \
+                mock.patch("hill_king.refresh"), \
+                mock.patch("hill_king.time.time", return_value=2000):
+            hill_king.once(post=False)
+        self.assertEqual(len(replayed), 1)
+        self.assertEqual(sorted(st["done"]), ["after", "before", "other"])
+        self.assertEqual(st["sync"], [])
+        sync.assert_not_called()
+
+    def test_an_announcement_names_the_season_from_the_second_on(self):
+        import tempfile
+        hill = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, hill)
+        with open(os.path.join(hill, "state.json"), "w") as fh:
+            json.dump({"next": 2, "members": [{"id": "a" * 16, "name": "K", "author": "x", "file": "k.red",
+                                                "arrived": 1, "age": 0}]}, fh)
+        sent = []
+        j = {"job_id": "j", "number": 7, "actor": {"name": "y"}}
+        with mock.patch("hill_king.request", side_effect=lambda path, doc, idem=None: sent.append(doc) or {}):
+            hill_king.announce(dict(self.season1(), computer="c", machine_seq=55500), j, hill)
+            hill_king.announce(dict(self.season2(), computer="c", machine_seq=55500), j, hill)
+        self.assertEqual(sent[0]["title"], "Новый король хилла Core War: K")
+        self.assertNotIn("сезон", sent[0]["body"])
+        self.assertEqual(sent[1]["title"], "Новый король хилла Core War, сезон 2: K")
+        self.assertIn("второго сезона", sent[1]["body"])
+
+
+class Seeds(unittest.TestCase):
+    """The next season opens with the closing season's top three, their code
+    as it was but for the one line a core of another size cannot assemble."""
+
+    def setUp(self):
+        import tempfile
+        self.hill = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.hill)
+        os.makedirs(os.path.join(self.hill, "warriors"))
+        import hashlib
+        self.srcs = {
+            "a": b";redcode-94\n;name A\n;assert CORESIZE == 8000\n        DAT 0, 0\n",
+            "b": b";redcode-94\n;name B\n;assert CORESIZE == 8000\r\n;assert MAXLENGTH >= 50\nx DAT 0, 0\n",
+            "c": b";name C\n        JMP 0\n",
+            "d": b";name D\n;assert CORESIZE == 8000\n",
+        }
+        self.ids = {k: hashlib.sha256(v).hexdigest()[:16] for k, v in self.srcs.items()}
+        for k, src in self.srcs.items():
+            with open(os.path.join(self.hill, "warriors", self.ids[k] + ".red"), "wb") as fh:
+                fh.write(src)
+        members = [{"id": self.ids[k], "file": k + ".red"} for k in "bacd"]
+        with open(os.path.join(self.hill, "state.json"), "w") as fh:
+            json.dump({"next": 5, "members": members}, fh)
+
+    def test_the_top_three_in_order_of_places(self):
+        got = hill_king.seeds(self.hill)
+        self.assertEqual([f for f, _ in got], ["1-b.red", "2-a.red", "3-c.red"])
+
+    def test_only_the_coresize_assert_goes(self):
+        got = dict(hill_king.seeds(self.hill))
+        self.assertEqual(got["2-a.red"], b";redcode-94\n;name A\n        DAT 0, 0\n")
+        self.assertEqual(got["1-b.red"], b";redcode-94\n;name B\n;assert MAXLENGTH >= 50\nx DAT 0, 0\n")
+        self.assertEqual(got["3-c.red"], self.srcs["c"])
+
+    def test_a_source_must_match_its_id(self):
+        with open(os.path.join(self.hill, "warriors", self.ids["a"] + ".red"), "ab") as fh:
+            fh.write(b"; changed\n")
+        with self.assertRaises(ValueError):
+            hill_king.seeds(self.hill)
+
+
+class Final(unittest.TestCase):
+    """The closing season's table with what anyone needs to check it."""
+
+    def test_the_table_and_the_hashes_of_the_snapshot(self):
+        import hashlib
+        import tempfile
+        hill = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, hill)
+        os.makedirs(os.path.join(hill, "warriors"))
+        files = {"hill.toml": b"rules\n", "state.json": json.dumps({"next": 3, "members": [
+            {"id": "a" * 16, "name": "A", "author": "x", "file": "a.red", "arrived": 1, "age": 3},
+            {"id": "b" * 16, "name": "B", "author": "y", "file": "b.red", "arrived": 2, "age": 1}]}).encode(),
+            "results.json": b'{"matches": {}}'}
+        for name, data in files.items():
+            with open(os.path.join(hill, name), "wb") as fh:
+                fh.write(data)
+        with mock.patch("hill_king.run", return_value="  #  score\n  1  900  A by x [aaaaaaaaaaaaaaaa]\n"):
+            text = hill_king.final({"cw": "cw", "season": 1}, hill)
+        self.assertIn("  1  900  A by x [aaaaaaaaaaaaaaaa]", text)
+        for name, data in files.items():
+            self.assertIn("%s %s" % (hashlib.sha256(data).hexdigest(), name), text)
+        self.assertIn("первого сезона", text)
+
+
+class RandomPlacement(unittest.TestCase):
+    """On a hill with placement = "random" a challenge is replayed from the
+    number it drew: the report carries it, and so does history.jsonl."""
+
+    def enter_args(self, **kw):
+        import tempfile
+        work = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, work)
+        theirs = os.path.join(work, "theirs")
+        os.makedirs(os.path.join(theirs, "warriors"))
+        src = b";name A\n"
+        import hashlib
+        wid = hashlib.sha256(src).hexdigest()[:16]
+        with open(os.path.join(theirs, "warriors", wid + ".red"), "wb") as fh:
+            fh.write(src)
+        calls = []
+        with mock.patch("hill_king.run", side_effect=lambda cfg, args: calls.append(args) or ""):
+            hill_king.enter({}, work, "ours", theirs, [{"id": wid, "file": "a.red", "status": "entered"}], **kw)
+        return calls[0]
+
+    def test_the_drawn_number_is_passed_on(self):
+        self.assertEqual(self.enter_args(seed=12345678901234567890)[-2:], ["--seed", "12345678901234567890"])
+
+    def test_a_hash_hill_gets_no_number(self):
+        self.assertNotIn("--seed", self.enter_args())
+
+    def test_replay_takes_the_number_from_the_report(self):
+        seen = []
+        with mock.patch("hill_king.parse", return_value=({"seed": 7, "challengers": []}, b"")), \
+                mock.patch("hill_king.prepare", return_value=("w", "o", "t")), \
+                mock.patch("hill_king.enter", side_effect=lambda *a, **kw: seen.append(kw.get("seed"))), \
+                mock.patch("hill_king.compare"):
+            hill_king.replay({}, "text", "hill")
+        self.assertEqual(seen, [7])
