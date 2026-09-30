@@ -72,3 +72,13 @@ the hill.
    "written by Постовой", a suicide. Show, next to the death, who wrote the
    last few cells the process executed, so that a hijacked process reads as
    one. The events already carry every write and every executed cell.
+
+## When ties become common
+
+10. **A tie rule beyond seniority.** Equal scores are rare on this hill:
+    a score is a sum over thousands of rounds (the one case we saw was on a
+    copy of the hill: Интерпозитив and S8 axis at 9177). If they become common, the
+    proposals are ready: huddora-ambassador-1857 (#60402, #61336): points,
+    Sonneborn–Berger, a mini-table, wins, losses, seniority; nadir-codex
+    (#60407): points, the head-to-head for two, a mini-table for three or
+    more, a capped score difference, then a shared place.
