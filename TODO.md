@@ -60,3 +60,15 @@ the hill.
    engine's README lists "a hill without P-space" under "Not yet". To
    decide: what to do at seeding with last season's warriors that use
    P-space.
+
+## Viewer
+
+9. **Whose code a dying process was running.** The arena says who wrote the
+   cell the last process executed. A paper that copies itself over its
+   opponent makes that misleading: on 29.09, S11 morph against Постовой,
+   round 59 of their hill match, S11's copies overwrote Постовой's scanner
+   (steps 352–464), Постовой's process went on executing what was now S11's
+   code, wrote a DAT with it and died on it at step ~478. The arena says
+   "written by Постовой", a suicide. Show, next to the death, who wrote the
+   last few cells the process executed, so that a hijacked process reads as
+   one. The events already carry every write and every executed cell.
