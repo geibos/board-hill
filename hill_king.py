@@ -46,7 +46,13 @@ bash -lc читает общий ~/.profile. Повтор делает это н
   "machine_hill": "/workspace/season<N>/hill"   хилл сезона на машине;
   "init": ["--size", "32", ...]   правила, с которыми создаётся своя копия;
   "freeze_at": <unix-время>       заморозка: задания, поданные с этого
-                                  момента, не считаются, хилл машины не читается.
+                                  момента, не считаются, хилл машины не читается;
+  "seeded": ["<id>", ...]         бойцы засева: автор в ;author не тот, кто их
+                                  вызывает, и это не ошибка;
+  "script_file": "<путь>"         взять hill.sh сезона из файла, а не с GitHub
+                                  (тесты, ручная проверка; sha256 сверяется так же).
+Со второго сезона анонсер повторяет вызов программой приёма бойца из hill.sh
+сезона (свои правила хилла: одинаковый код, PER_AUTHOR) и проверяет автора.
 Своя копия первого сезона — STATE_DIR/hill, остальных — STATE_DIR/season<N>/hill.
 Состояние и своя копия хилла — ~/.local/state/board-hill/. После каждого
 прохода, если своя копия изменилась, она же выкладывается в public/ рядом —
@@ -234,11 +240,115 @@ def prepare(cfg, snap, hill):
     return work, ours, theirs
 
 
-def enter(cfg, work, ours, theirs, challengers, seed=None):
-    """Одна заявка cw hill challenge на своей копии: те же претенденты под
-    теми же именами файлов, исходники из снимка, хеш каждого сверен с id.
-    seed — число, от которого заявка разложила матчи на хилле со случайной
-    раскладкой (из отчёта или history.jsonl машины); на хилле на хешах — None."""
+def season_script(cfg):
+    """hill.sh сезона, сверенный с закреплённым sha256: из script_file (тесты,
+    ручная проверка), из своего кэша или с GitHub на закреплённом коммите."""
+    cache = os.path.join(STATE_DIR, "hill-%s.sh" % cfg["script_sha256"][:16])
+    path = cfg.get("script_file") or cache
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            data = fh.read()
+    else:
+        url = "https://raw.githubusercontent.com/%s/%s/%s" % (cfg["repo"], cfg["commit"], cfg["script"])
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "hill_king"}),
+                                    timeout=60) as r:
+            data = r.read()
+    if hashlib.sha256(data).hexdigest() != cfg["script_sha256"]:
+        raise ValueError("hill.sh сезона (%s) не совпал с закреплённым sha256" % path)
+    if path == cache and not os.path.exists(cache):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(cache, "wb") as fh:
+            fh.write(data)
+    return data.decode()
+
+
+def admission(cfg):
+    """Свои правила хилла со второго сезона: программа приёма бойца из
+    hill.sh сезона (между <<'ADMIT' и ADMIT), PER_AUTHOR и PARAMS оттуда же.
+    Первый сезон — None: только cw."""
+    if int(cfg.get("season", 1)) < 2:
+        return None
+    text = season_script(cfg)
+    if "<<'ADMIT'\n" not in text:
+        return None
+    program = os.path.join(STATE_DIR, "admit-%s.py" % cfg["script_sha256"][:16])
+    if not os.path.exists(program):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(program, "w") as fh:
+            fh.write(text.split("<<'ADMIT'\n", 1)[1].split("\nADMIT\n", 1)[0])
+    return {"program": program,
+            "limit": int(re.search(r"^PER_AUTHOR=(\d+)$", text, re.M).group(1)),
+            "params": re.search(r'^PARAMS="([^"]*)"$', text, re.M).group(1)}
+
+
+def admit_run(cfg, adm, ours, path, seed):
+    """Приём одного бойца программой сезона на своей копии, как на машине."""
+    env = dict(os.environ)
+    env.pop("HILL_SEED", None)
+    if seed is not None:
+        env["HILL_SEED"] = str(seed)
+    r = subprocess.run(["python3", adm["program"], cfg["cw"], ours, str(adm["limit"]), adm["params"], path],
+                       capture_output=True, text=True, env=env, timeout=1800)
+    if r.returncode != 0:
+        raise ValueError("приём бойца не повторился: %s" % (r.stderr or r.stdout).strip()[:300])
+
+
+def author_in(cfg, adm, path):
+    """Строка ;author бойца, как её читает cw."""
+    got = json.loads(run(cfg, ["check", path, "--json"] + adm["params"].split()) or "[]")
+    return got[0].get("author") if got else None
+
+
+def thread_posts(cfg):
+    """Все ответы в треде машины (автор, время, текст), от новых к старым."""
+    out, before = [], None
+    while True:
+        d = request("/v1/posts/%s?limit=30%s" % (cfg["computer"], "&before=%d" % before if before else ""))
+        page = d.get("replies") or {}
+        items = page.get("items") or []
+        out += [{"author": p.get("author"), "created_at": p.get("created_at"), "body": p.get("body") or ""}
+                for p in items]
+        before = page.get("next_before")
+        if not items or not before:
+            return out
+
+
+def code_ids(body):
+    """id исходников в блоках кода сообщения: текст блока как есть и с одним
+    переводом строки в конце."""
+    ids = set()
+    for block in re.findall(r"```[^\n]*\n(.*?)```", body, re.S):
+        for text in (block, block.rstrip("\n") + "\n"):
+            ids.add(hashlib.sha256(text.encode()).hexdigest()[:16])
+    return ids
+
+
+def owner_check(cfg, adm, job, path, wid):
+    """Лимит мест считает ;author, поэтому автор — тот, кто бросил вызов, или
+    тот, кто до вызова выложил этот самый исходник в тред машины (вызов по его
+    просьбе), или боец засева сезона (seeded в настройках)."""
+    if wid in cfg.get("seeded", []):
+        return
+    author = author_in(cfg, adm, path)
+    actor = (job.get("actor") or {}).get("name")
+    if author == actor:
+        return
+    at = job.get("submitted_at") or 0
+    if any(p["author"] == author and (p["created_at"] or 0) < at and wid in code_ids(p["body"])
+           for p in thread_posts(cfg)):
+        return
+    raise ValueError("боец [%s]: в строке ;author — %s, а вызов №%s бросил %s; исходника этого бойца "
+                     "от %s в треде машины до вызова нет" % (wid, author, job.get("number"), actor, author))
+
+
+def enter(cfg, work, ours, theirs, challengers, seed=None, job=None):
+    """Одна заявка на своей копии: те же претенденты под теми же именами
+    файлов, исходники из снимка, хеш каждого сверен с id. seed — число, от
+    которого заявка разложила матчи на хилле со случайной раскладкой (из
+    отчёта или history.jsonl машины); на хилле на хешах — None. Со второго
+    сезона заявка — один боец, и принимает его программа сезона (admission);
+    job — задание, которым его подали: по нему проверяется автор."""
+    adm = admission(cfg)
     files = []
     tmp = tempfile.mkdtemp(dir=work)
     for c in challengers:
@@ -253,8 +363,18 @@ def enter(cfg, work, ours, theirs, challengers, seed=None):
         with open(path, "wb") as fh:
             fh.write(src)
         files.append(path)
-    if files:
+    if not files:
+        return
+    if adm is None:
         run(cfg, ["hill", "challenge", ours] + files + (["--seed", str(seed)] if seed is not None else []))
+        return
+    if len(files) != 1:
+        raise ValueError("со второго сезона заявка — один боец, а их %d" % len(files))
+    if job is not None:
+        with open(files[0], "rb") as fh:
+            wid = hashlib.sha256(fh.read()).hexdigest()[:16]
+        owner_check(cfg, adm, job, files[0], wid)
+    admit_run(cfg, adm, ours, files[0], seed)
 
 
 def compare(ours, theirs):
@@ -267,12 +387,12 @@ def compare(ours, theirs):
         raise ValueError("результаты матчей не совпали с повтором")
 
 
-def replay(cfg, text, hill):
+def replay(cfg, text, hill, job=None):
     """Повторить прогон из вывода на копии своего хилла. Возвращает (копия,
     отчёт) при полном совпадении, иначе бросает ValueError с причиной."""
     report, snap = parse(text)
     work, ours, theirs = prepare(cfg, snap, hill)
-    enter(cfg, work, ours, theirs, report["challengers"], seed=report.get("seed"))
+    enter(cfg, work, ours, theirs, report["challengers"], seed=report.get("seed"), job=job)
     compare(ours, theirs)
     return ours, report
 
@@ -292,10 +412,11 @@ def digest(snap):
     return h.hexdigest()[:16]
 
 
-def sync_replay(cfg, snap, hill):
+def sync_replay(cfg, snap, hill, pending=None):
     """Догнать хилл машины на своей копии. Новых заявок столько, на сколько
     вырос счётчик next; какие и в каком порядке — из history.jsonl машины
     (ей не верим: неверный порядок или состав не сойдётся при сравнении).
+    Задание каждой заявки — по её времени среди pending (для проверки автора).
     Возвращает (копия, времена повторённых строк истории), None — если
     нового нет; не сошлось — ValueError."""
     work, ours, theirs = prepare(cfg, snap, hill)
@@ -316,7 +437,8 @@ def sync_replay(cfg, snap, hill):
     tail = entered[len(entered) - new:]
     groups = sorted({i for i, _ in tail})
     for g in groups:
-        enter(cfg, work, ours, theirs, [c for i, c in tail if i == g], seed=lines[g].get("seed"))
+        job = author_of(cfg, lines[g].get("time"), pending or []) if admission(cfg) else None
+        enter(cfg, work, ours, theirs, [c for i, c in tail if i == g], seed=lines[g].get("seed"), job=job)
     compare(ours, theirs)
     return ours, [lines[g].get("time") for g in groups]
 
@@ -424,7 +546,7 @@ def sync(cfg, st, hill, post):
         return
     key = digest(snap)
     try:
-        got = sync_replay(cfg, snap, hill)
+        got = sync_replay(cfg, snap, hill, pending)
     except (ValueError, OSError, KeyError, json.JSONDecodeError) as e:
         print("хилл машины не сходится с повтором: %s" % e)
         if post and st.get("bad") != key:
@@ -474,7 +596,7 @@ def once(post=True):
             st["sync"].append(brief(j))
             continue
         try:
-            copy, _ = replay(cfg, output(cfg, jid), hill)
+            copy, _ = replay(cfg, output(cfg, jid), hill, job=j)
         except (ValueError, OSError, KeyError, json.JSONDecodeError) as e:
             print("задание %s: вывод не сошёлся (%s), сверим по хиллу машины" % (j.get("number"), e))
             st["sync"].append(brief(j))

@@ -333,7 +333,7 @@ class Seasons(unittest.TestCase):
                 mock.patch("hill_king.jobs", return_value=listed), \
                 mock.patch("hill_king.job", side_effect=lambda c, jid: details[jid]), \
                 mock.patch("hill_king.output", return_value="out"), \
-                mock.patch("hill_king.replay", side_effect=lambda c, t, h: replayed.append(t) or ("copy", {})), \
+                mock.patch("hill_king.replay", side_effect=lambda c, t, h, job=None: replayed.append(t) or ("copy", {})), \
                 mock.patch("hill_king.take"), \
                 mock.patch("hill_king.sync") as sync, \
                 mock.patch("hill_king.refresh"), \
@@ -425,6 +425,119 @@ class Final(unittest.TestCase):
         for name, data in files.items():
             self.assertIn("%s %s" % (hashlib.sha256(data).hexdigest(), name), text)
         self.assertIn("первого сезона", text)
+
+
+class HillRules(unittest.TestCase):
+    """From season two the hill has rules of its own on top of cw's (same
+    code refused, PER_AUTHOR warriors an author at most): season<N>/hill.sh
+    applies them with the program between <<'ADMIT' and ADMIT, and the
+    announcer replays a challenge with that same program, taken from the
+    season's hill.sh at its pinned hash. The limit counts `;author`, so the
+    announcer also checks that the author is who ran the challenge."""
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def setUp(self):
+        import tempfile
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.state)
+        patcher = mock.patch("hill_king.STATE_DIR", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.script = os.path.join(self.HERE, "season2", "hill.sh")
+        import hashlib
+        with open(self.script, "rb") as fh:
+            self.sha = hashlib.sha256(fh.read()).hexdigest()
+
+    def cfg(self, **kw):
+        return dict({"season": 2, "script_file": self.script, "script_sha256": self.sha, "cw": "cw",
+                     "commit": "1" * 40, "repo": "geibos/board-hill", "script": "season2/hill.sh"}, **kw)
+
+    def test_season_one_has_no_rules_of_its_own(self):
+        self.assertIsNone(hill_king.admission({"commit": "c" * 40, "script_sha256": "9" * 64}))
+
+    def test_the_program_is_the_one_in_the_seasons_hill_sh(self):
+        adm = hill_king.admission(self.cfg())
+        with open(self.script) as fh:
+            text = fh.read()
+        with open(adm["program"]) as fh:
+            self.assertEqual(fh.read(), text.split("<<'ADMIT'\n", 1)[1].split("\nADMIT\n", 1)[0])
+        self.assertEqual(adm["limit"], 3)
+        self.assertEqual(adm["params"], "-s 8192 -c 65536 -p 8192 -l 128 -d 128")
+
+    def test_a_runner_with_another_hash_is_not_used(self):
+        with self.assertRaises(ValueError):
+            hill_king.admission(self.cfg(script_sha256="0" * 64))
+
+    def enter(self, cfg, challengers, **kw):
+        import hashlib
+        import tempfile
+        work = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, work)
+        theirs = os.path.join(work, "theirs")
+        os.makedirs(os.path.join(theirs, "warriors"))
+        for c in challengers:
+            with open(os.path.join(theirs, "warriors", c["id"] + ".red"), "wb") as fh:
+                fh.write(c.pop("src"))
+        calls = []
+        with mock.patch("hill_king.run", side_effect=lambda cfg, args: calls.append(("cw", args)) or ""), \
+                mock.patch("hill_king.admit_run", side_effect=lambda *a: calls.append(("admit",) + a)), \
+                mock.patch("hill_king.author_in", return_value=kw.pop("author", "x")), \
+                mock.patch("hill_king.thread_posts", return_value=kw.pop("posts", [])):
+            hill_king.enter(cfg, work, "ours", theirs, challengers, **kw)
+        return calls
+
+    def one(self, src=b";name A\n;author x\n"):
+        import hashlib
+        return {"id": hashlib.sha256(src).hexdigest()[:16], "file": "a.red", "status": "entered", "src": src}
+
+    def test_a_challenge_is_replayed_with_the_seasons_program(self):
+        calls = self.enter(self.cfg(), [self.one()], seed=42)
+        self.assertEqual(len(calls), 1)
+        kind, cfg, adm, ours, path, seed = calls[0]
+        self.assertEqual((kind, ours, seed), ("admit", "ours", 42))
+        self.assertEqual(adm["limit"], 3)
+
+    def test_season_one_is_replayed_with_cw_alone(self):
+        calls = self.enter({}, [self.one()])
+        self.assertEqual(calls[0][0], "cw")
+
+    def test_a_challenge_of_more_than_one_warrior_is_not_replayed(self):
+        with self.assertRaises(ValueError):
+            self.enter(self.cfg(), [self.one(), self.one(b";name B\n;author x\n")])
+
+    def job(self, actor="x", at=1000):
+        return {"number": 9, "actor": {"name": actor}, "submitted_at": at}
+
+    def test_the_author_who_ran_the_challenge_owns_the_warrior(self):
+        self.assertEqual(len(self.enter(self.cfg(), [self.one()], job=self.job("x"), author="x")), 1)
+
+    def test_someone_elses_name_in_the_author_line_is_refused(self):
+        with self.assertRaises(ValueError) as e:
+            self.enter(self.cfg(), [self.one()], job=self.job("y"), author="x")
+        self.assertIn("x", str(e.exception))
+
+    def post(self, author, body, at):
+        return {"author": author, "body": body, "created_at": at}
+
+    def test_a_warrior_its_author_posted_in_the_machines_thread_may_be_run_by_another(self):
+        w = self.one(b";name A\n;author x\nJMP 0\n")
+        body = "My warrior:\n\n```\n;name A\n;author x\nJMP 0\n```\nplease run it"
+        calls = self.enter(self.cfg(), [w], job=self.job("veteran", at=1000), author="x",
+                           posts=[self.post("x", body, 900)])
+        self.assertEqual(len(calls), 1)
+
+    def test_a_post_after_the_challenge_or_by_someone_else_does_not_count(self):
+        body = "```\n;name A\n;author x\nJMP 0\n```"
+        for post in (self.post("x", body, 1100), self.post("z", body, 900)):
+            with self.assertRaises(ValueError):
+                self.enter(self.cfg(), [self.one(b";name A\n;author x\nJMP 0\n")],
+                           job=self.job("veteran", at=1000), author="x", posts=[post])
+
+    def test_a_seed_of_the_season_needs_no_post(self):
+        w = self.one()
+        calls = self.enter(self.cfg(seeded=[w["id"]]), [w], job=self.job("operator"), author="x")
+        self.assertEqual(len(calls), 1)
 
 
 class RandomPlacement(unittest.TestCase):

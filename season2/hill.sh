@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The Core War hill on the board's shared computer: season two.
 #
-#   bash hill.sh challenge FILE...   each file challenges the hill in turn
+#   bash hill.sh challenge FILE      one warrior challenges the hill
 #   bash hill.sh show                the table
 #   bash hill.sh verify              check the hill: every match replayed
 #   bash hill.sh final ROUND         the season's final table: every pair of the
@@ -46,8 +46,14 @@ declare -A SUMS=(
   [aarch64]=9e1e018f0626861d58c81d9f48b39b0aa4279ceaeff717607e25115a646dd08b
 )
 # season2/hill.toml, as `cw hill init` writes it with these rules.
-RULES="--size 32 --rounds 512 -s 8192 -c 65536 -p 8192 -l 128 -d 128"
+PARAMS="-s 8192 -c 65536 -p 8192 -l 128 -d 128"
+RULES="--size 32 --rounds 512 $PARAMS"
 RULES_SUM=8c88f452704fb0514b53e853189b0ae6780b4b2192dfea6fa93bf6446e8bb9ab
+# The hill's own rules, on top of cw's: a warrior whose assembled code (the
+# output of `cw list`) is on the hill already is refused, and an author (the
+# `;author` line) has at most PER_AUTHOR warriors on the hill (0: no limit):
+# one more pushes off the author's own weakest, not someone else's.
+PER_AUTHOR=3
 # The final table: matches per pair, and the beacon it is placed from.
 FINAL_RUNS=32
 DRAND_CHAIN=52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971
@@ -263,13 +269,124 @@ print("results sha256 %s (the file's match lines, sorted)" % hashlib.sha256(resu
 FINAL
 }
 
+# One warrior challenges the hill, under the hill's own rules (PER_AUTHOR
+# above); prints cw's report as JSON. The announcer replays a challenge by
+# running this same program, taken from this file at the season's commit, on
+# its own copy of the hill, with HILL_SEED set to the seed in the report.
+admit() {
+  python3 - "$cw" "$HILL" "$PER_AUTHOR" "$PARAMS" "$1" <<'ADMIT'
+import fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile
+
+cw, hill, limit, params, file = sys.argv[1:6]
+limit, params = int(limit), params.split()
+seed = os.environ.get("HILL_SEED")
+seeded = ["--seed", seed] if seed else []
+
+
+def fail(code, why):
+    print("hill.sh: " + why, file=sys.stderr)
+    sys.exit(code)
+
+
+def cw_run(args):
+    r = subprocess.run([cw] + args, capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(2, "cw %s: %s" % (" ".join(args[:2]), (r.stderr or r.stdout).strip()))
+    return r.stdout
+
+
+def code(path):
+    """SHA-256 of the assembled program; None if it does not assemble."""
+    r = subprocess.run([cw, "list", path] + params, capture_output=True, text=True)
+    return hashlib.sha256(r.stdout.encode()).hexdigest() if r.returncode == 0 else None
+
+
+def load(path, empty):
+    return json.load(open(path)) if os.path.exists(path) else empty
+
+
+members = load(os.path.join(hill, "state.json"), {"members": []})["members"]
+
+# The same code under another name or with other comments is the same warrior.
+mine = code(file)
+if mine is not None:
+    for m in members:
+        if code(os.path.join(hill, "warriors", m["id"] + ".red")) == mine:
+            fail(3, "%s has the same code as %s [%s] on the hill (sha256 of `cw list` %s); not played"
+                 % (os.path.basename(file), m["name"], m["id"], mine))
+
+checked = json.loads(subprocess.run([cw, "check", file, "--json"] + params,
+                                    capture_output=True, text=True).stdout or "[]")
+author = checked[0].get("author") if checked and checked[0].get("ok") else None
+if not limit or author is None or sum(m["author"] == author for m in members) < limit:
+    print(cw_run(["hill", "challenge", hill, file, "--json"] + seeded), end="")
+    sys.exit(0)
+
+# The author is at the limit. The challenge is played on a copy of the hill
+# one place larger, so that nobody else is pushed off; then the author's
+# weakest leaves (the challenger, if it is the weakest), cw ranks the rest
+# under the hill's own rules, and the copy replaces the hill's files.
+lock = open(os.path.join(hill, ".lock"), "a")
+fcntl.flock(lock, fcntl.LOCK_EX)
+work = tempfile.mkdtemp()
+try:
+    h = os.path.join(work, "hill")
+    shutil.copytree(hill, h, ignore=shutil.ignore_patterns(".lock"))
+    toml = open(os.path.join(hill, "hill.toml")).read()
+    size = int(re.search(r"^size = (\d+)$", toml, re.M).group(1))
+    with open(os.path.join(h, "hill.toml"), "w") as fh:
+        fh.write(re.sub(r"^size = \d+$", "size = %d" % (size + 1), toml, flags=re.M))
+    report = json.loads(cw_run(["hill", "challenge", h, file, "--json"] + seeded))
+
+    state = json.load(open(os.path.join(h, "state.json")))
+    results = json.load(open(os.path.join(h, "results.json")))
+    theirs = [m for m in state["members"] if m["author"] == author]
+    gone = theirs[limit:]  # best first: the weakest are past the limit
+    out = {m["id"] for m in gone}
+    state["members"] = [m for m in state["members"] if m["id"] not in out]
+    for key in ("matches", "seeds"):
+        if key in results:
+            results[key] = {k: v for k, v in results[key].items() if not set(k.split(":")) & out}
+    for name, doc in (("state.json", state), ("results.json", results)):
+        with open(os.path.join(h, name), "w") as fh:
+            json.dump(doc, fh)
+    shutil.copyfile(os.path.join(hill, "hill.toml"), os.path.join(h, "hill.toml"))
+    ranked = json.loads(cw_run(["hill", "challenge", h, "--json"]))
+
+    left = [{"id": m["id"], "name": m["name"], "author": m["author"],
+             "reason": "per author: %d warriors at most" % limit} for m in gone]
+    lines = open(os.path.join(h, "history.jsonl")).read().splitlines()
+    last = json.loads(lines[-1])
+    for doc in (last, report):
+        doc["pushed_off"] = doc.get("pushed_off", []) + left
+        for c in doc["challengers"]:
+            if c.get("id") in out:
+                c["status"] = "pushed_off"
+    lines[-1] = json.dumps(last, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(h, "history.jsonl"), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    report["standings"] = ranked["standings"]
+
+    os.makedirs(os.path.join(hill, "warriors"), exist_ok=True)
+    for name in os.listdir(os.path.join(h, "warriors")):
+        if not os.path.exists(os.path.join(hill, "warriors", name)):
+            shutil.copyfile(os.path.join(h, "warriors", name), os.path.join(hill, "warriors", name))
+    for name in ("results.json", "state.json", "history.jsonl"):
+        shutil.copyfile(os.path.join(h, name), os.path.join(hill, name + ".new"))
+        os.replace(os.path.join(hill, name + ".new"), os.path.join(hill, name))
+finally:
+    shutil.rmtree(work, ignore_errors=True)
+print(json.dumps(report, ensure_ascii=False, indent=2))
+ADMIT
+}
+
 cmd=${1:-}
 shift || true
 case "$cmd" in
   challenge)
-    [ $# -gt 0 ] || { echo "usage: bash hill.sh challenge FILE..." >&2; exit 2; }
+    [ $# -eq 1 ] || { echo "usage: bash hill.sh challenge FILE (one warrior a challenge)" >&2; exit 2; }
     rules
-    "$cw" hill challenge "$HILL" "$@" --json > "$tmp/report.json"
+    admit "$1" > "$tmp/report.json"
     "$cw" hill show "$HILL"
     receipt
     echo "----- cw-hill report -----"
@@ -297,7 +414,7 @@ case "$cmd" in
     echo "----- cw-hill end -----"
     ;;
   *)
-    echo "usage: bash hill.sh challenge FILE... | show | verify | final DRAND_ROUND" >&2
+    echo "usage: bash hill.sh challenge FILE | show | verify | final DRAND_ROUND" >&2
     exit 2
     ;;
 esac
