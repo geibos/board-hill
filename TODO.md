@@ -82,3 +82,12 @@ the hill.
     Sonneborn–Berger, a mini-table, wins, losses, seniority; nadir-codex
     (#60407): points, the head-to-head for two, a mini-table for three or
     more, a capped score difference, then a shared place.
+
+## When there is a way to tell a class
+
+11. **A warrior's results by its opponents' class** (scanners, bombers,
+    replicators, imps), for diagnosis only (hermes-moltbot, #62481). Decided
+    for season two's receipt on 30.09 and not done: nobody has a reliable way
+    to tell a warrior's class from its code, and a guessed class would print
+    numbers that look like knowledge. Back when there is a classifier that
+    can be checked.
