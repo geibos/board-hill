@@ -540,6 +540,136 @@ class HillRules(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class Restore(unittest.TestCase):
+    """When the machine's hill does not match the announcer's replay, the
+    announcer puts its own checked copy back on the machine itself: the copy
+    must verify, it is uploaded in chunks, checked on the machine with the
+    season's hill.sh before it replaces the hill, the bad hill is kept aside,
+    and the thread is told. Once per bad state, never after the freeze."""
+
+    def setUp(self):
+        import tempfile
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.state)
+        self.hill = os.path.join(self.state, "hill")
+        os.makedirs(os.path.join(self.hill, "warriors"))
+        for name, data in (("hill.toml", "rules\n"), ("results.json", '{"matches": {}}'),
+                           ("state.json", json.dumps({"next": 4, "members": [
+                               {"id": "a" * 16, "name": "K", "author": "x", "file": "k.red", "arrived": 1, "age": 2}]})),
+                           ("warriors/" + "a" * 16 + ".red", ";name K\n")):
+            with open(os.path.join(self.hill, name), "w") as fh:
+                fh.write(data)
+
+    def cfg(self, **kw):
+        return dict({"computer": "c-1", "commit": "c" * 40, "script_sha256": "9" * 64, "cw": "cw"}, **kw)
+
+    def test_a_mismatch_asks_for_a_restore(self):
+        st = {"done": [], "king": None, "sync": [{"number": 7}]}
+        with mock.patch("hill_king.machine_job", return_value=("j", "succeeded", "out")), \
+                mock.patch("hill_king.parse_sync", return_value=b"snap"), \
+                mock.patch("hill_king.digest", return_value="k1"), \
+                mock.patch("hill_king.sync_replay", side_effect=ValueError("состав не совпал")), \
+                mock.patch("hill_king.complain") as complain:
+            hill_king.sync(self.cfg(), st, self.hill, post=True)
+        complain.assert_called_once()
+        self.assertEqual(st["restore"], "k1")
+
+    def restore(self, cfg=None, verify_ok=True, job_state="succeeded", out="ok: 1 members\nok: 1 members\n"):
+        st = {"done": [], "king": "a" * 16, "bad": "k1", "restore": "k1"}
+        calls = {"job": [], "posts": []}
+
+        def run(cfg, args):
+            if args[:2] == ["hill", "verify"] and not verify_ok:
+                raise ValueError("cw hill verify: 1 problem")
+            return ""
+
+        def machine_job(command, timeout=900, uploads=None):
+            calls["job"].append((command, uploads))
+            return "jid", job_state, out
+
+        with mock.patch("hill_king.run", side_effect=run), \
+                mock.patch("hill_king.machine_job", side_effect=machine_job), \
+                mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None:
+                           calls["posts"].append((path, doc)) or {"id": "p"}):
+            hill_king.restore(cfg or self.cfg(), st, self.hill)
+        return st, calls
+
+    def test_the_checked_copy_goes_back_and_the_thread_is_told(self):
+        st, calls = self.restore()
+        (command, uploads), = calls["job"]
+        (path, data), = uploads
+        import tarfile
+        names = tarfile.open(fileobj=io.BytesIO(data)).getnames()
+        self.assertIn("state.json", names)
+        self.assertIn(path, command)
+        self.assertIn("c" * 40, command)
+        self.assertIn("9" * 64, command)
+        self.assertLess(command.index("verify"), command.index("mv "))
+        self.assertIn("rejected", command)
+        self.assertNotIn("restore", st)
+        self.assertEqual(st["restored"], "k1")
+        (where, doc), = calls["posts"]
+        self.assertEqual(where, "/v1/posts/c-1/replies")
+        self.assertIn("возвращён", doc["body"])
+
+    def test_a_copy_that_does_not_verify_is_not_put_back(self):
+        st, calls = self.restore(verify_ok=False)
+        self.assertEqual(calls["job"], [])
+        self.assertNotIn("restore", st)
+
+    def test_a_failed_restore_job_is_not_reported_as_done(self):
+        st, calls = self.restore(job_state="failed")
+        self.assertEqual(calls["posts"], [])
+        self.assertNotIn("restored", st)
+
+    def test_restore_can_be_turned_off(self):
+        st, calls = self.restore(cfg=self.cfg(restore=False))
+        self.assertEqual(calls["job"], [])
+
+    def test_the_same_bad_state_is_not_restored_twice(self):
+        st = {"done": [], "king": None, "bad": "k1", "restored": "k1", "sync": [{"number": 8}]}
+        with mock.patch("hill_king.machine_job", return_value=("j", "succeeded", "out")), \
+                mock.patch("hill_king.parse_sync", return_value=b"snap"), \
+                mock.patch("hill_king.digest", return_value="k1"), \
+                mock.patch("hill_king.sync_replay", side_effect=ValueError("состав не совпал")), \
+                mock.patch("hill_king.complain"):
+            hill_king.sync(self.cfg(), st, self.hill, post=True)
+        self.assertNotIn("restore", st)
+
+    def test_the_history_keeps_the_lines_of_the_accepted_challenges(self):
+        import subprocess
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        lines = [{"time": 1, "challengers": [{"id": "a", "status": "entered"}, {"id": "b", "status": "pushed_off"}]},
+                 {"time": 2, "challengers": [{"id": "c", "status": "duplicate"}]},
+                 {"time": 3, "challengers": [{"id": "d", "status": "entered"}]},
+                 {"time": 4, "challengers": [{"id": "e", "status": "entered"}]}]
+        src, dst = os.path.join(d, "old.jsonl"), os.path.join(d, "new.jsonl")
+        with open(src, "w") as fh:
+            fh.write("".join(json.dumps(x) + "\n" for x in lines))
+        subprocess.run(["python3", "-c", hill_king.HISTORY_CUT, src, dst, "3"], check=True)
+        with open(dst) as fh:
+            self.assertEqual([json.loads(x)["time"] for x in fh], [1, 2, 3])
+
+    def test_upload_goes_in_chunks_each_checked(self):
+        import hashlib
+        data = os.urandom(20000)
+        sent = []
+
+        def request(path, doc=None, idem=None):
+            sent.append(doc)
+            whole = b"".join(base64.b64decode(x["content_base64"]) for x in sent)
+            return {"sha256": hashlib.sha256(whole).hexdigest()}
+
+        import base64
+        with mock.patch("hill_king.request", side_effect=request):
+            hill_king.upload("/v1/computers/c-1", 5, "x.tgz", data)
+        self.assertEqual([x["operation"] for x in sent], ["create", "append", "append"])
+        self.assertEqual(sent[1]["expected_sha256"], hashlib.sha256(data[:9000]).hexdigest())
+        self.assertTrue(all(x["generation"] == 5 for x in sent))
+
+
 class RandomPlacement(unittest.TestCase):
     """On a hill with placement = "random" a challenge is replayed from the
     number it drew: the report carries it, and so does history.jsonl."""

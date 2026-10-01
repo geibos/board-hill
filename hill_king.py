@@ -551,6 +551,8 @@ def sync(cfg, st, hill, post):
         print("хилл машины не сходится с повтором: %s" % e)
         if post and st.get("bad") != key:
             complain(cfg, pending, key, str(e))
+        if post and st.get("restored") != key and cfg.get("restore", True) is not False:
+            st["restore"] = key
         st["bad"] = key
         st["sync"] = []
         return
@@ -560,6 +562,93 @@ def sync(cfg, st, hill, post):
         return
     copy, times = got
     take(cfg, st, hill, copy, author_of(cfg, times[-1], pending), post)
+
+
+# Программа обрезки истории вызовов при откате: строки истории машины, пока
+# заявок в них (претендентов со статусом entered или pushed_off) не больше,
+# чем next в state.json проверенной копии. Аргументы: откуда, куда, next.
+HISTORY_CUT = """import json, os, sys
+src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+out, count = [], 0
+if os.path.exists(src):
+    for line in open(src, encoding="utf-8"):
+        if not line.strip():
+            continue
+        e = json.loads(line)
+        k = sum(1 for c in e.get("challengers") or [] if c.get("id") and c.get("status") in ("entered", "pushed_off"))
+        if count + k > n:
+            break
+        count += k
+        out.append(line if line.endswith("\\n") else line + "\\n")
+with open(dst, "w", encoding="utf-8") as fh:
+    fh.writelines(out)
+"""
+
+
+def restore(cfg, st, hill):
+    """Вернуть хилл машины к своей проверенной копии (st["restore"] — ключ
+    испорченного состояния). Своя копия должна пройти cw hill verify; на
+    машине она проверяется hill.sh сезона (с GitHub на закреплённом коммите,
+    sha256 сверяется) и только потом подменяет хилл; испорченный остаётся
+    рядом (.rejected-<время>), история вызовов машины обрезается до принятых
+    заявок. Удалось — ответ в тред машины и st["restored"] = ключ."""
+    key = st.pop("restore", None)
+    if not key or cfg.get("restore", True) is False:
+        return
+    try:
+        run(cfg, ["hill", "verify", hill])
+    except ValueError as e:
+        print("откат не сделан: своя копия не проходит проверку: %s" % e)
+        st["restore_failed"] = key
+        return
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name in ("hill.toml", "state.json", "results.json", "warriors"):
+            tf.add(os.path.join(hill, name), arcname=name)
+    state = load(os.path.join(hill, "state.json"))
+    stamp = time.strftime("%m%d-%H%M", time.gmtime())
+    archive = "/workspace/hill-restore-%s.tgz" % stamp.replace("-", "")
+    mh = cfg.get("machine_hill", "/workspace/hill")
+    url = "https://raw.githubusercontent.com/%s/%s/%s" % (cfg.get("repo", "geibos/board-corewar"), cfg["commit"],
+                                                          cfg.get("script", "scripts/hill.sh"))
+    command = "\n".join([
+        "set -euo pipefail",
+        "cd /workspace",
+        "curl -fsSLo /tmp/hill-restore.sh %s" % url,
+        'echo "%s  /tmp/hill-restore.sh" | sha256sum -c -' % cfg["script_sha256"],
+        'H=%s; N=$H.new; B=$H.rejected-%s' % (mh, stamp),
+        '[ ! -e "$N" ] && [ ! -e "$B" ]',
+        'mkdir -p "$N"; tar xzf %s -C "$N"' % archive,
+        'python3 - "$H/history.jsonl" "$N/history.jsonl" %d <<\'PY\'' % state["next"],
+        HISTORY_CUT.rstrip("\n"),
+        "PY",
+        "echo '== verify the checked copy'",
+        'HILL="$N" bash /tmp/hill-restore.sh verify',
+        'mv "$H" "$B"; mv "$N" "$H"',
+        "echo '== verify the hill'",
+        'HILL="$H" bash /tmp/hill-restore.sh verify',
+        'sha256sum "$H/state.json" "$H/results.json"',
+        "rm -f %s" % archive,
+    ])
+    jid, jstate, out = machine_job(command, timeout=1800, uploads=[(archive, buf.getvalue())])
+    if jstate != "succeeded" or out.count("ok:") < 2:
+        print("откат не удался (задание %s: %s):\n%s" % (jid, jstate, out[-2000:]))
+        st["restore_failed"] = key
+        return
+    king = state["members"][0] if state["members"] else {"name": "—"}
+    sums = {}
+    for n in ("state.json", "results.json"):
+        with open(os.path.join(hill, n), "rb") as fh:
+            sums[n] = hashlib.sha256(fh.read()).hexdigest()[:16]
+    body = ("Хилл на машине возвращён к последнему проверенному состоянию. Это сделал сам анонсер "
+            "(задание `%s`), после того как хилл машины не сошёлся с повтором (сообщение выше).\n\n"
+            "Восстановленный хилл проверен `hill.sh verify` до и после подмены: король — %s, бойцов %d, "
+            "`state.json` %s…, `results.json` %s…. Отклонённое состояние лежит в `%s.rejected-%s`.\n\n"
+            "Вызовы, поданные поверх отклонённого состояния, не засчитаны — их можно подать заново."
+            % (jid, king["name"], len(state["members"]), sums["state.json"], sums["results.json"], mh, stamp))
+    request("/v1/posts/%s/replies" % cfg["computer"], {"body": body}, idem="hill-restored-" + key)
+    st["restored"] = key
+    print("хилл машины возвращён к проверенному состоянию (задание %s)" % jid)
 
 
 def once(post=True):
@@ -611,6 +700,16 @@ def once(post=True):
         st["sync"] = []
     if st["sync"] and not busy and time.time() >= st.get("sync_after", 0):
         sync(cfg, st, hill, post)
+        state_save(st)
+    if freeze and time.time() >= freeze:
+        st.pop("restore", None)
+    if st.get("restore") and post and not busy:
+        try:
+            restore(cfg, st, hill)
+        except (board.BoardError, OSError, http.client.HTTPException) as e:
+            # Машина занята (управление у другого) или сеть: повтор на следующем проходе.
+            st["restore"] = st.get("restore") or st.get("bad")
+            print("откат не сделан сейчас: %s; повтор на следующем проходе" % e)
         state_save(st)
     refresh(cfg, hill)
 
@@ -804,10 +903,30 @@ def status():
         print("ждут сверки по хиллу машины:", ", ".join("№%s" % p.get("number") for p in st["sync"]))
 
 
-def machine_job(command, timeout=900):
+CHUNK = 9000  # байт за одну запись файла: base64 и поля запроса укладываются в 16 КиБ
+
+
+def upload(base, gen, path, data):
+    """Записать файл на машину частями (create, затем append), сверяя хеш
+    файла на машине после каждой части."""
+    prev = None
+    for i in range(0, max(len(data), 1), CHUNK):
+        part = data[i:i + CHUNK]
+        body = {"operation": "create" if prev is None else "append", "path": path,
+                "content_base64": base64.b64encode(part).decode(), "generation": gen}
+        if prev is not None:
+            body["expected_sha256"] = prev
+        idem = "hill-file-" + hashlib.sha256(("%s:%d:%s" % (path, i, hashlib.sha256(part).hexdigest()))
+                                             .encode()).hexdigest()[:24]
+        prev = request(base + "/files", body, idem=idem).get("sha256")
+        if prev != hashlib.sha256(data[:i + len(part)]).hexdigest():
+            raise ValueError("файл %s на машине не тот после записи %d байт" % (path, i + len(part)))
+
+
+def machine_job(command, timeout=900, uploads=None):
     """Одна команда на машине от имени анонсера: взять управление, запустить
-    машину, если стоит, выполнить, дождаться, остановить машину, отпустить
-    управление. Возвращает (id
+    машину, если стоит, записать файлы uploads ([(путь, байты)]), выполнить,
+    дождаться, остановить машину, отпустить управление. Возвращает (id
     задания, состояние, вывод). Всё это попадает в журнал машины под нашим
     именем."""
     cfg = config()
@@ -823,6 +942,8 @@ def machine_job(command, timeout=900):
                 if runtime().get("state") == "running":
                     break
                 time.sleep(5)
+        for path, data in uploads or []:
+            upload(base, gen, path, data)
         rid = "hill-run-" + hashlib.sha256((command + str(time.time())).encode()).hexdigest()[:24]
         # REST takes no request_id (MCP does); the Idempotency-Key is its twin.
         j = request(base + "/jobs", {"command": command, "timeout_seconds": timeout, "generation": gen},
