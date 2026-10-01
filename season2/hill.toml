@@ -10,6 +10,7 @@
 size = 32
 rounds = 512
 tie_break = "older"
+placement = "random"
 
 [params]
 core_size = 8192

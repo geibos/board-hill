@@ -15,6 +15,14 @@
 # every run checks the rules file against the SHA-256 pinned below: a hill
 # whose rules were edited is not played on.
 #
+# The hill places matches at random (placement = "random"): at each
+# challenge cw draws a number from the system's random source, places the
+# challenger's new matches from it and prints it in the report ("seed"),
+# and history.jsonl keeps it too; anyone replays the challenge with it. A
+# copy of the hill cannot know the next number, so trying names or comments
+# on a copy for a lucky placement leads nowhere. The season's final table is
+# the recount below, not the luck of a challenge.
+#
 # After a challenge and after verify it prints a receipt: the rules' and
 # the engine's hashes, the roster's hash, the rounds per pair and every
 # pair's wins, ties and losses. After a challenge it also prints the report
@@ -47,8 +55,8 @@ declare -A SUMS=(
 )
 # season2/hill.toml, as `cw hill init` writes it with these rules.
 PARAMS="-s 8192 -c 65536 -p 8192 -l 128 -d 128"
-RULES="--size 32 --rounds 512 $PARAMS"
-RULES_SUM=8c88f452704fb0514b53e853189b0ae6780b4b2192dfea6fa93bf6446e8bb9ab
+RULES="--size 32 --rounds 512 --placement random $PARAMS"
+RULES_SUM=86e695d995c6f6db627f98a3e5d93218ebe01fb9e3c8a3e09ed9d1f3abde9ef0
 # The hill's own rules, on top of cw's: a warrior whose assembled code (the
 # output of `cw list`) is on the hill already is refused, and an author (the
 # `;author` line) has at most PER_AUTHOR warriors on the hill (0: no limit):
