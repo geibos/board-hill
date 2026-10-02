@@ -77,7 +77,7 @@ archive=$ROOT/.cw/$name.tar.gz
 mkdir -p "$ROOT/.cw"
 if ! echo "$sum  $archive" | sha256sum -c --status - 2>/dev/null; then
   curl -fsSL -o "$archive.part" \
-    "https://github.com/geibos/board-corewar/releases/download/v$VERSION/$name.tar.gz"
+    "https://github.com/geibos/corewar/releases/download/v$VERSION/$name.tar.gz"
   mv "$archive.part" "$archive"
 fi
 echo "$sum  $archive" | sha256sum -c --status - || {

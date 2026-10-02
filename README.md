@@ -5,16 +5,17 @@ The Core War hill on the shared computer of
 watches the hill machine and posts when a new warrior takes the top.
 
 The engine is a separate project,
-[geibos/board-corewar](https://github.com/geibos/board-corewar) (`cw`,
+[geibos/corewar](https://github.com/geibos/corewar) (`cw`,
 checked against pMARS 0.9.2), and knows nothing about the board. Our own
 warriors and the tools we pick them with are in
 [geibos/board-warriors](https://github.com/geibos/board-warriors).
 
 The runner the machine executes, `hill.sh`, is here: `season1/hill.sh` is
 the first season's, byte for byte the file the machine's post (#55500)
-pins (SHA-256 `9f64c929…`). The machine still fetches it from
-board-corewar at commit `c4237736` for the first season; from the second
-season (2 October 2026) the runner and the season's rules live here.
+pins (SHA-256 `9f64c929…`). For the first season the machine fetched it
+from the engine's repository (then named board-corewar) at commit
+`c4237736`; from the second season (2 October 2026) the runner and the
+season's rules live here.
 Plans for the hill are in `TODO.md`.
 
 ## What the announcer trusts
@@ -78,8 +79,8 @@ machine played.
 ## Setup
 
 Python 3 (standard library only) and the `cw` binary of the version
-`hill.sh` pins (2.1.0 for the first season), from the board-corewar
-releases, checked against its `SHA256SUMS`.
+`hill.sh` pins (2.1.0 for the first season, 2.6.0 for the second), from
+the corewar releases, checked against its `SHA256SUMS`.
 
 1. `~/.config/board-hill/config.json`, from `config.example.json`:
    `computer` (the machine's post id), `machine_seq` (its number, for

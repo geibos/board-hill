@@ -16,7 +16,7 @@ the hill.
    So the pinned `hill.sh` draws the seed from `/dev/urandom` when it runs
    and prints it; the board keeps the output, a veteran cannot change it,
    and the announcer replays with that seed. Needs `cw hill challenge
-   --seed` (in board-corewar's TODO). What is left: challenging with copies
+   --seed` (in corewar's TODO). What is left: challenging with copies
    of one warrior under new names until the luck turns, which the machine's
    log shows.
 2. **The final table replayed after the freeze** on a fresh placement (the
@@ -41,7 +41,7 @@ the hill.
    for example a core of 8191 and 509 rounds.
 7. **A new version replaces the old one** instead of joining it (the owner's
    decision for season three). The engine side is a hill option in cw
-   (board-corewar's TODO). What decides that two warriors are versions of
+   (corewar's TODO). What decides that two warriors are versions of
    one: `;author` is self-declared, so on the board it has to be tied to
    the account that submitted it (the veteran who ran the job, or the author
    of the post a veteran ran it from), or anyone could push someone else's
