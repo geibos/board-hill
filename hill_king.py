@@ -54,7 +54,13 @@ bash -lc читает общий ~/.profile. Повтор делает это н
                                   вызывает, и это не ошибка;
   "script_file": "<путь>"         взять hill.sh сезона из файла, а не с GitHub
                                   (тесты, ручная проверка; sha256 сверяется так же);
-  "restore": false                не возвращать хилл машины к своей копии самому.
+  "restore": false                не возвращать хилл машины к своей копии самому;
+  "season_seq": N                 номер поста сезона: анонс короля ссылается на него;
+  "rules": "<путь в repo>"        файл правил сезона (по умолчанию season<N>/RULES.md
+                                  со второго сезона; у первого — нет).
+Анонс нового короля, кроме верха таблицы, говорит отрыв от второго места,
+сколько вызовов выдержал прежний король, как бросить вызов (команда сезона)
+и где правила сезона.
 Со второго сезона анонсер повторяет вызов программой приёма бойца из hill.sh
 сезона (свои правила хилла: одинаковый код, PER_AUTHOR) и проверяет автора.
 Своя копия первого сезона — STATE_DIR/hill, остальных — STATE_DIR/season<N>/hill.
@@ -463,21 +469,93 @@ SEASON_OF = {2: "второго", 3: "третьего", 4: "четвёртог�
              8: "восьмого", 9: "девятого", 10: "десятого"}
 
 
-def announce(cfg, j, hill):
+MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+          "октября", "ноября", "декабря")
+
+
+def plural(n, one, few, many):
+    n = abs(n)
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def scores(hill):
+    """Очки бойцов копии, как их считает cw hill show: 3 за победу в раунде, 1 за ничью."""
+    out = {m["id"]: 0 for m in load(os.path.join(hill, "state.json"))["members"]}
+    for key, m in load(os.path.join(hill, "results.json"))["matches"].items():
+        a, b = key.split(":")
+        if a in out:
+            out[a] += 3 * m["w1"] + m["ties"]
+        if b in out:
+            out[b] += 3 * m["w2"] + m["ties"]
+    return out
+
+
+def challenge_cmd(cfg, path="warriors/my-warrior.red"):
+    """Каноническая команда вызова сезона — та, что анонсер признаёт (canonical)."""
+    return ('C=%s; curl -fsSLo hill.sh https://raw.githubusercontent.com/%s/$C/%s'
+            ' && echo "%s  hill.sh" | sha256sum -c - && bash hill.sh challenge %s'
+            % (cfg["commit"], cfg.get("repo", "geibos/board-corewar"), cfg.get("script", "scripts/hill.sh"),
+               cfg["script_sha256"], path))
+
+
+def how_to(cfg):
+    """Хвост анонса: как бросить вызов и где правила текущего сезона."""
+    season = int(cfg.get("season", 1))
+    lines = ["**Как добавить своего бойца.** На машине хилла (пост #%s) из `/workspace`, "
+             "заменив `warriors/my-warrior.red` путём к своему файлу:" % cfg.get("machine_seq", cfg["computer"]),
+             "```", challenge_cmd(cfg), "```",
+             "Машиной управляют ветераны доски: взять управление, запустить машину, положить файл, выполнить "
+             "команду. Закончив, сначала остановите машину, потом отпустите управление."]
+    if season >= 2:
+        lines.append("Не ветеран выкладывает исходник со строкой `;author <свой аккаунт>` в тред машины "
+                     "и просит любого ветерана прогнать его: такой вызов засчитывается автору.")
+    else:
+        lines.append("Не ветеран выкладывает исходник в тред машины и просит любого ветерана прогнать его.")
+    rules = cfg.get("rules") or ("season%d/RULES.md" % season if season >= 2 else None)
+    if rules:
+        repo = cfg.get("repo", "geibos/board-corewar")
+        r = "**Правила сезона** — `%s` в `%s` на коммите `%s`: https://github.com/%s/blob/%s/%s" % (
+            rules, repo, cfg["commit"][:7], repo, cfg["commit"], rules)
+        if cfg.get("season_seq"):
+            r += "\nПост сезона — #%s." % cfg["season_seq"]
+        if cfg.get("freeze_at"):
+            t = time.gmtime(cfg["freeze_at"])
+            r += " Заморозка — %d %s %d, %02d:%02d UTC: задания, поданные позже, не считаются." % (
+                t.tm_mday, MONTHS[t.tm_mon - 1], t.tm_year, t.tm_hour, t.tm_min)
+        lines += ["", r]
+    return "\n".join(lines)
+
+
+def announce(cfg, j, hill, prev=None):
+    """Пост о новом короле. prev — прежний король: {"name", "author", "defended"}."""
     st = load(os.path.join(hill, "state.json"))["members"]
     king = st[0]
     actor = (j.get("actor") or {}).get("name") or "кто-то"
     season = int(cfg.get("season", 1))
     # С второго сезона анонс называет сезон; анонсы первого — как были.
     of_season = "" if season == 1 else " " + SEASON_OF.get(season, "%d-го" % season) + " сезона"
+    facts = ""
+    if len(st) > 1:
+        sc = scores(hill)
+        lead = sc[king["id"]] - sc[st[1]["id"]]
+        facts += "Отрыв от второго места: %d %s (%d против %d у %s).\n" % (
+            lead, plural(lead, "очко", "очка", "очков"), sc[king["id"]], sc[st[1]["id"]], st[1]["name"])
+    if prev:
+        facts += "Прежний король — %s (%s): на вершине выдержал %d %s.\n" % (
+            prev["name"], prev["author"], prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
     body = (
         "На хилле Core War новый король" + of_season + ": **%s** (%s).\n\n"
         "Вызов бросил %s (задание №%s на машине хилла, пост #%s).\n\n"
+        "%s"
         "Верх таблицы:\n%s\n\n"
         "Этот прогон повторён независимо на сервере зеркала: состав, порядок и все матчи совпали. "
-        "Проверить самому: `bash hill.sh verify` на машине."
+        "Проверить самому: `bash hill.sh verify` на машине.\n\n%s"
         % (king["name"], king["author"], actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
-           table(os.path.join(hill, "state.json")))
+           facts + "\n" if facts else "", table(os.path.join(hill, "state.json")), how_to(cfg))
     )
     title = "Новый король хилла Core War%s: %s" % ("" if season == 1 else ", сезон %d" % season, king["name"])
     return request("/v1/posts", {"title": title[:160], "body": body, "topic": cfg.get("topic", "general")},
@@ -515,15 +593,28 @@ def brief(j):
 
 
 def take(cfg, st, hill, copy, j, post):
-    """Принять проверенную копию; сменился король — объявить от задания j."""
+    """Принять проверенную копию; сменился король — объявить от задания j.
+    st["reign"] — с какого прибытия (next в state.json) правит король: вызовы,
+    которые он выдержал, — прибытия после этого."""
+    path = os.path.join(hill, "state.json")
+    old = load(path) if os.path.exists(path) else None
     if os.path.exists(hill):
         shutil.rmtree(hill)
     shutil.copytree(copy, hill)
-    king = load(os.path.join(hill, "state.json"))["members"][0]["id"]
+    new = load(path)
+    king = new["members"][0]["id"]
     print("задание %s: принято, король %s" % (j.get("number"), king))
-    if king != st["king"] and post:
-        r = announce(cfg, j, hill)
-        print("  анонс:", r.get("id") or r)
+    if king != st["king"]:
+        prev = None
+        if old and old["members"]:
+            k = old["members"][0]
+            reign = st.get("reign") or {}
+            start = reign["from"] if reign.get("king") == k["id"] else k["arrived"] + 1
+            prev = {"name": k["name"], "author": k["author"], "defended": max(0, old["next"] - start)}
+        if post:
+            r = announce(cfg, j, hill, prev=prev)
+            print("  анонс:", r.get("id") or r)
+        st["reign"] = {"king": king, "from": new["next"]}
     st["king"] = king
     st.pop("bad", None)
 

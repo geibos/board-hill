@@ -704,3 +704,85 @@ class RandomPlacement(unittest.TestCase):
                 mock.patch("hill_king.compare"):
             hill_king.replay({}, "text", "hill")
         self.assertEqual(seen, [7])
+
+
+class Announcement(unittest.TestCase):
+    """A new king's post says by how much it leads, how long the old king
+    held, how anyone adds a warrior and where the season's rules are."""
+
+    CFG = {"computer": "c", "machine_seq": 55500, "commit": "1" * 40, "script_sha256": "2" * 64,
+           "repo": "geibos/board-hill", "script": "season2/hill.sh", "season": 2, "season_seq": 69960,
+           "freeze_at": 1791504000}
+
+    def hill(self, members, matches, nxt):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        with open(os.path.join(d, "state.json"), "w") as fh:
+            json.dump({"next": nxt, "members": members}, fh)
+        with open(os.path.join(d, "results.json"), "w") as fh:
+            json.dump({"fingerprint": "f", "matches": matches}, fh)
+        return d
+
+    def two(self, nxt=7):
+        a, b = "a" * 16, "b" * 16
+        return self.hill([{"id": a, "name": "K", "author": "x", "file": "k.red", "arrived": 6, "age": 0},
+                          {"id": b, "name": "Old", "author": "y", "file": "o.red", "arrived": 1, "age": 1}],
+                         {a + ":" + b: {"w1": 300, "w2": 12, "ties": 200}}, nxt)
+
+    def body(self, cfg=None, prev=None):
+        sent = []
+        j = {"job_id": "j", "number": 7, "actor": {"name": "x"}}
+        with mock.patch("hill_king.request", side_effect=lambda path, doc, idem=None: sent.append(doc) or {}):
+            hill_king.announce(cfg or self.CFG, j, self.two(), prev=prev)
+        return sent[0]["body"]
+
+    def test_scores_are_three_a_win_and_one_a_tie(self):
+        self.assertEqual(hill_king.scores(self.two()), {"a" * 16: 1100, "b" * 16: 236})
+
+    def test_the_lead_over_the_second_place(self):
+        self.assertIn("Отрыв от второго места: 864 очка (1100 против 236 у Old).", self.body())
+
+    def test_how_many_challenges_the_old_king_held(self):
+        b = self.body(prev={"name": "Old", "author": "y", "defended": 2})
+        self.assertIn("Прежний король — Old (y): на вершине выдержал 2 вызова.", b)
+        self.assertNotIn("Прежний король", self.body())
+
+    def test_how_to_add_a_warrior_with_the_seasons_own_command(self):
+        b = self.body()
+        cmd = [line for line in b.splitlines() if line.startswith("C=")]
+        self.assertEqual(len(cmd), 1)
+        self.assertTrue(hill_king.canonical(self.CFG).match(cmd[0]))
+        self.assertIn("warriors/my-warrior.red", cmd[0])
+        self.assertIn("ветеран", b)
+        self.assertIn("остановите", b)
+
+    def test_where_the_seasons_rules_are(self):
+        b = self.body()
+        self.assertIn("https://github.com/geibos/board-hill/blob/%s/season2/RULES.md" % ("1" * 40), b)
+        self.assertIn("#69960", b)
+        self.assertIn("9 октября 2026, 00:00 UTC", b)
+
+    def test_season_one_names_no_rules_file(self):
+        cfg = {"computer": "c", "machine_seq": 55500, "commit": "1" * 40, "script_sha256": "2" * 64}
+        b = self.body(cfg)
+        self.assertNotIn("RULES.md", b)
+        self.assertTrue(any(hill_king.canonical(cfg).match(line) for line in b.splitlines()))
+
+    def take(self, st, old_next=5, old_arrived=1):
+        a, b = "a" * 16, "b" * 16
+        old = self.hill([{"id": b, "name": "Old", "author": "y", "file": "o.red", "arrived": old_arrived, "age": 3}],
+                        {}, old_next)
+        seen = []
+        with mock.patch("hill_king.announce", side_effect=lambda cfg, j, hill, prev=None: seen.append(prev) or {}):
+            hill_king.take(self.CFG, st, old, self.two(nxt=7), {"number": 7}, True)
+        return seen
+
+    def test_a_new_king_starts_a_reign_and_the_old_ones_is_counted(self):
+        st = {"king": "b" * 16, "reign": {"king": "b" * 16, "from": 3}}
+        self.assertEqual(self.take(st), [{"name": "Old", "author": "y", "defended": 2}])
+        self.assertEqual(st["reign"], {"king": "a" * 16, "from": 7})
+
+    def test_a_reign_without_a_record_counts_from_the_kings_arrival(self):
+        st = {"king": "b" * 16}
+        self.assertEqual(self.take(st, old_next=5, old_arrived=1)[0]["defended"], 3)
