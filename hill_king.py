@@ -904,7 +904,9 @@ def author_of(cfg, t, pending):
     for j in list(pending) + [brief(x) for x in jobs(cfg, 30)]:
         if t is not None and (j.get("started_at") or 0) - 5 <= t <= (j.get("finished_at") or 0) + 5:
             return j
-    return pending[-1] if pending else {"job_id": "sync-%s" % t, "number": "?", "actor": None}
+    # Задания не нашли: время события — то, что записал сам хилл, а не «сейчас»
+    # (иначе отсчёт до заморозки уехал бы вперёд).
+    return pending[-1] if pending else {"job_id": "sync-%s" % t, "number": "?", "actor": None, "submitted_at": t}
 
 
 def sync(cfg, st, hill, post):
@@ -1088,7 +1090,10 @@ def once(post=True):
             print("откат не сделан сейчас: %s; повтор на следующем проходе" % e)
         state_save(st)
     try:
-        season_end(cfg, st, hill, post)
+        # Пока задание идёт или хилл машины не догнан, состояние ещё может
+        # сдвинуть момент заморозки: конец сезона не объявляется.
+        if not busy and not st.get("sync"):
+            season_end(cfg, st, hill, post)
     except (board.BoardError, OSError, ValueError, subprocess.SubprocessError, http.client.HTTPException) as e:
         print("конец сезона не оформлен сейчас: %s; повтор на следующем проходе" % e)
     state_save(st)

@@ -1054,3 +1054,38 @@ class Commentary(unittest.TestCase):
     def test_no_countdown_before_the_hill_is_full(self):
         st = {"done": [], "king": self.A, "reign": {"king": self.A, "from": 1, "at": 500}}
         self.assertEqual(self.countdown(st, 500 + 50 * self.H), [])
+
+
+class SeasonEndSafety(unittest.TestCase):
+    """The end of a season is not declared on a state that may still move."""
+
+    CFG = SeasonEnd.CFG
+
+    def test_no_freeze_while_a_job_is_still_running(self):
+        st = {"done": [], "king": "k", "sync": []}
+        listed = [{"job_id": "run", "number": 1, "state": "running"}]
+        with mock.patch("hill_king.config", return_value=self.CFG), \
+                mock.patch("hill_king.state_load", return_value=st), \
+                mock.patch("hill_king.state_save"), \
+                mock.patch("hill_king.jobs", return_value=listed), \
+                mock.patch("hill_king.season_end") as end, \
+                mock.patch("hill_king.refresh"):
+            hill_king.once(post=True)
+        end.assert_not_called()
+
+    def test_no_freeze_while_the_machines_hill_is_not_caught_up(self):
+        st = {"done": [], "king": "k", "sync": [{"job_id": "x", "number": 5}], "sync_after": 10 ** 12}
+        with mock.patch("hill_king.config", return_value=self.CFG), \
+                mock.patch("hill_king.state_load", return_value=st), \
+                mock.patch("hill_king.state_save"), \
+                mock.patch("hill_king.jobs", return_value=[]), \
+                mock.patch("hill_king.season_end") as end, \
+                mock.patch("hill_king.refresh"), \
+                mock.patch("hill_king.time.time", return_value=1000):
+            hill_king.once(post=True)
+        end.assert_not_called()
+
+    def test_an_unknown_challenge_keeps_the_time_the_hill_recorded(self):
+        with mock.patch("hill_king.jobs", return_value=[]):
+            j = hill_king.author_of(self.CFG, 12345, [])
+        self.assertEqual(j["submitted_at"], 12345)
