@@ -781,8 +781,276 @@ class Announcement(unittest.TestCase):
     def test_a_new_king_starts_a_reign_and_the_old_ones_is_counted(self):
         st = {"king": "b" * 16, "reign": {"king": "b" * 16, "from": 3}}
         self.assertEqual(self.take(st), [{"name": "Old", "author": "y", "defended": 2}])
-        self.assertEqual(st["reign"], {"king": "a" * 16, "from": 7})
+        self.assertEqual({k: st["reign"][k] for k in ("king", "from")}, {"king": "a" * 16, "from": 7})
 
     def test_a_reign_without_a_record_counts_from_the_kings_arrival(self):
         st = {"king": "b" * 16}
         self.assertEqual(self.take(st, old_next=5, old_arrived=1)[0]["defended"], 3)
+
+
+class SeasonEnd(unittest.TestCase):
+    """Season three ends when the hill is full and its king has held for
+    hold_hours, counted from no earlier than the filling, or at the deadline
+    (freeze_at); the announcer finds the moment, announces it, recounts and
+    publishes the final table."""
+
+    H = 3600
+    CFG = {"computer": "c", "machine_seq": 55500, "commit": "1" * 40, "script_sha256": "2" * 64,
+           "repo": "geibos/board-hill", "script": "season3/hill.sh", "season": 3,
+           "freeze_at": 1796083200, "hold_hours": 97}
+
+    def st(self, full_at=None, king_at=None):
+        st = {"done": [], "king": "k" * 16, "reign": {"king": "k" * 16, "from": 1}}
+        if king_at is not None:
+            st["reign"]["at"] = king_at
+        if full_at is not None:
+            st["ends"] = {"3": {"full_at": full_at}}
+        return st
+
+    def test_before_the_hill_is_full_only_the_deadline_counts(self):
+        self.assertEqual(hill_king.freeze_of(self.CFG, self.st(king_at=1000)), (1796083200, "deadline"))
+
+    def test_a_full_hill_ends_hold_hours_after_the_last_change_of_king(self):
+        self.assertEqual(hill_king.freeze_of(self.CFG, self.st(full_at=1000, king_at=5000)),
+                         (5000 + 97 * self.H, "rule"))
+
+    def test_the_hold_counts_from_the_filling_when_the_king_is_older(self):
+        self.assertEqual(hill_king.freeze_of(self.CFG, self.st(full_at=9000, king_at=100)),
+                         (9000 + 97 * self.H, "rule"))
+
+    def test_the_deadline_wins_when_it_is_earlier(self):
+        late = 1796083200 - 10 * self.H
+        self.assertEqual(hill_king.freeze_of(self.CFG, self.st(full_at=late, king_at=late)),
+                         (1796083200, "deadline"))
+
+    def test_another_seasons_filling_does_not_count(self):
+        st = self.st(king_at=1000)
+        st["ends"] = {"2": {"full_at": 500}}
+        self.assertEqual(hill_king.freeze_of(self.CFG, st), (1796083200, "deadline"))
+
+    def test_without_the_rule_the_freeze_is_the_fixed_one(self):
+        cfg = dict(self.CFG, hold_hours=None)
+        self.assertEqual(hill_king.freeze_of(cfg, self.st(full_at=1000, king_at=1000)), (1796083200, "deadline"))
+        self.assertEqual(hill_king.freeze_of({}, self.st()), (None, None))
+
+    def test_the_drand_round_is_the_first_strictly_after(self):
+        self.assertEqual(hill_king.drand_round(1791504000), 32900213)
+        self.assertEqual(hill_king.drand_round(1796083200), 34426613)
+        self.assertEqual(hill_king.drand_round(1791504001), 32900213)
+        self.assertEqual(hill_king.drand_round(1791504003), 32900214)
+
+    def hill(self, n, size, nxt=None):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        members = [{"id": "%016x" % i, "name": "W%d" % i, "author": "a%d" % i, "file": "w.red",
+                    "arrived": i, "age": 0} for i in range(n)]
+        with open(os.path.join(d, "state.json"), "w") as fh:
+            json.dump({"next": nxt or n, "members": members}, fh)
+        with open(os.path.join(d, "results.json"), "w") as fh:
+            json.dump({"fingerprint": "f", "matches": {}}, fh)
+        with open(os.path.join(d, "hill.toml"), "w") as fh:
+            fh.write("size = %d\nrounds = 509\n" % size)
+        return d
+
+    def test_take_records_when_the_hill_filled_and_when_the_king_came(self):
+        st = self.st()
+        st["king"] = "x" * 16
+        with mock.patch("hill_king.announce", return_value={}):
+            hill_king.take(self.CFG, st, self.hill(2, 3), self.hill(3, 3), {"number": 9, "submitted_at": 7777}, True)
+        self.assertEqual(st["ends"]["3"]["full_at"], 7777)
+        self.assertEqual(st["reign"]["at"], 7777)
+
+    def test_the_filling_moment_is_kept_once_set(self):
+        st = self.st(full_at=1000)
+        with mock.patch("hill_king.announce", return_value={}):
+            hill_king.take(self.CFG, st, self.hill(3, 3), self.hill(3, 3), {"number": 9, "submitted_at": 9999}, True)
+        self.assertEqual(st["ends"]["3"]["full_at"], 1000)
+
+    def test_a_challenge_after_the_moment_does_not_count(self):
+        cmd = ('C=%s; curl -fsSLo hill.sh https://raw.githubusercontent.com/geibos/board-hill/$C/season3/hill.sh'
+               ' && echo "%s  hill.sh" | sha256sum -c - && bash hill.sh challenge warriors/a.red' % ("1" * 40, "2" * 64))
+        t = 5000 + 97 * self.H
+        st = self.st(full_at=1000, king_at=5000)
+        listed = [{"job_id": "before", "number": 1, "state": "succeeded"},
+                  {"job_id": "after", "number": 2, "state": "succeeded"}]
+        details = {"before": {"state": "succeeded", "submitted_at": t - 1, "command": cmd, "number": 1},
+                   "after": {"state": "succeeded", "submitted_at": t, "command": cmd, "number": 2}}
+        replayed = []
+        with mock.patch("hill_king.config", return_value=self.CFG), \
+                mock.patch("hill_king.state_load", return_value=st), \
+                mock.patch("hill_king.state_save"), \
+                mock.patch("hill_king.jobs", return_value=listed), \
+                mock.patch("hill_king.job", side_effect=lambda c, jid: details[jid]), \
+                mock.patch("hill_king.output", return_value="out"), \
+                mock.patch("hill_king.replay", side_effect=lambda c, txt, h, job=None: replayed.append(job["number"]) or ("copy", {})), \
+                mock.patch("hill_king.take"), \
+                mock.patch("hill_king.season_end"), \
+                mock.patch("hill_king.refresh"), \
+                mock.patch("hill_king.time.time", return_value=t + 10):
+            hill_king.once(post=False)
+        self.assertEqual(replayed, [1])
+
+    def test_the_freeze_is_announced_once_with_its_round(self):
+        st = self.st(full_at=1000, king_at=5000)
+        t = 5000 + 97 * self.H
+        sent = []
+        hill = self.hill(3, 3)
+        with mock.patch("hill_king.request", side_effect=lambda path, doc, idem=None: sent.append((path, doc, idem)) or {"id": "p"}), \
+                mock.patch("hill_king.time.time", return_value=t + 10), \
+                mock.patch("hill_king.final_recount") as recount:
+            hill_king.season_end(self.CFG, st, hill, True)
+            hill_king.season_end(self.CFG, st, hill, True)
+        posts = [s for s in sent if s[0] == "/v1/posts"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1]["title"], "Хилл Core War: третий сезон заморожен")
+        self.assertIn("третий сезон, заморожен", posts[0][1]["body"])
+        self.assertIn(str(hill_king.drand_round(t)), posts[0][1]["body"].replace(" ", ""))
+        self.assertIn("97", posts[0][1]["body"])
+        recount.assert_not_called()  # the round is not out yet: t + 10 is before it
+
+    def test_nothing_is_announced_before_the_moment(self):
+        st = self.st(full_at=1000, king_at=5000)
+        with mock.patch("hill_king.request") as req, \
+                mock.patch("hill_king.time.time", return_value=5000 + 96 * self.H):
+            hill_king.season_end(self.CFG, st, self.hill(3, 3), True)
+        req.assert_not_called()
+
+    def test_party_cup_by_the_strategy_line(self):
+        rows = [{"id": "a", "place": 1}, {"id": "b", "place": 2}, {"id": "c", "place": 3}]
+        sources = {"a": ";name A\n;strategy plain paper\n",
+                   "b": ";name B\n;strategy for Public Ledger: paper\n",
+                   "c": ";name C\n;strategy public-ledger and more\n"}
+        parties = [{"slug": "public-ledger", "name": "Public Ledger"}, {"slug": "omerta", "name": "Синдикат Омерта"}]
+        self.assertEqual(hill_king.cup(rows, sources, parties), [("Public Ledger", "b", 2)])
+
+    def test_the_final_post_has_the_table_round_and_hashes(self):
+        out = ("drand quicknet round 34426613: api.drand.sh\nrandomness abc\n"
+               "seed = sha256(\"RANDOMNESS:RULES:ROSTER\") = def\n"
+               "  #    score     W     T     L  name\n"
+               "  1      900   100   600     0  K by k [%s]\n"
+               "results sha256 %s (the file's match lines, sorted)\n" % ("1" * 16, "9" * 64))
+        hill = self.hill(1, 3)
+        sent = []
+        with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append((path, doc)) or {"items": []}):
+            hill_king.final_post(self.CFG, hill, 34426613, out, "rule", 1796083200 - 10)
+        doc = [d for p, d in sent if p == "/v1/posts"][0]
+        self.assertIn("K by k", doc["body"])
+        self.assertIn("9" * 64, doc["body"])
+        self.assertIn("34426613", doc["body"].replace(" ", ""))
+        self.assertIn("state.json", doc["body"])
+
+
+class Commentary(unittest.TestCase):
+    """With commentary on, the announcer comments in the machine's thread on
+    every accepted challenge, and once a day on a full hill tells how long the
+    king has held and how long is left to the freeze."""
+
+    H = 3600
+    CFG = {"computer": "c", "machine_seq": 55500, "commit": "1" * 40, "script_sha256": "2" * 64,
+           "repo": "geibos/board-hill", "script": "season3/hill.sh", "season": 3,
+           "freeze_at": 1796083200, "hold_hours": 97, "commentary": True}
+
+    def hill(self, members, size, matches=None, history=None):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        ms = [{"id": i, "name": n, "author": a, "file": "w.red", "arrived": k, "age": 0}
+              for k, (i, n, a) in enumerate(members)]
+        with open(os.path.join(d, "state.json"), "w") as fh:
+            json.dump({"next": len(ms), "members": ms}, fh)
+        with open(os.path.join(d, "results.json"), "w") as fh:
+            json.dump({"fingerprint": "f", "matches": matches or {}}, fh)
+        with open(os.path.join(d, "hill.toml"), "w") as fh:
+            fh.write("size = %d\n" % size)
+        with open(os.path.join(d, "history.jsonl"), "w") as fh:
+            fh.write(json.dumps(history or {"challengers": [], "pushed_off": []}) + "\n")
+        return d
+
+    A, B, C, D = "a" * 16, "b" * 16, "c" * 16, "d" * 16
+
+    def take(self, st, old, new, cfg=None, when=7000):
+        sent = []
+        with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append((path, doc, idem)) or {"id": "x"}):
+            hill_king.take(cfg or self.CFG, st, old, new, {"job_id": "j9", "number": 9, "submitted_at": when}, True)
+        return [d["body"] for p, d, i in sent if p == "/v1/posts/c/replies"]
+
+    def test_a_new_warrior_is_commented_in_the_machines_thread(self):
+        st = {"done": [], "king": self.A}
+        old = self.hill([(self.A, "Alpha", "x")], 3)
+        new = self.hill([(self.A, "Alpha", "x"), (self.B, "Beta", "y")], 3,
+                        matches={self.A + ":" + self.B: {"w1": 100, "w2": 50, "ties": 359}})
+        out = self.take(st, old, new)
+        self.assertEqual(len(out), 1)
+        self.assertIn("**Beta** (y)", out[0])
+        self.assertIn("2-м", out[0])
+        self.assertIn("509", out[0])  # Beta: 3*50 + 359
+        self.assertIn("2 из 3", out[0])
+
+    def test_who_left_and_why(self):
+        st = {"done": [], "king": self.A}
+        old = self.hill([(self.A, "Alpha", "x"), (self.B, "Beta", "y")], 2)
+        new = self.hill([(self.A, "Alpha", "x"), (self.C, "Beta", "y")], 2,
+                        history={"challengers": [{"id": self.C, "status": "entered"}],
+                                 "pushed_off": [{"id": self.B, "name": "Beta", "author": "y",
+                                                 "reason": "replaced by a new version"}]})
+        out = self.take(st, old, new)
+        self.assertIn("Beta", out[0])
+        self.assertIn("новой версией", out[0])
+
+    def test_the_filling_starts_the_countdown(self):
+        st = {"done": [], "king": self.A}
+        old = self.hill([(self.A, "Alpha", "x")], 2)
+        new = self.hill([(self.A, "Alpha", "x"), (self.B, "Beta", "y")], 2)
+        out = self.take(st, old, new, when=10000)
+        self.assertIn("заполнен", out[0])
+        self.assertIn("97", out[0])
+
+    def test_a_new_king_is_named_and_the_clock_restarts(self):
+        st = {"done": [], "king": self.A, "ends": {"3": {"full_at": 1000}}}
+        old = self.hill([(self.A, "Alpha", "x"), (self.B, "Beta", "y")], 2)
+        new = self.hill([(self.C, "Gamma", "z"), (self.A, "Alpha", "x")], 2)
+        with mock.patch("hill_king.announce", return_value={}):
+            out = self.take(st, old, new)
+        self.assertIn("корол", out[0].lower())
+        self.assertIn("Gamma", out[0])
+        self.assertIn("заново", out[0])
+
+    def test_without_commentary_nothing_is_posted(self):
+        st = {"done": [], "king": self.A}
+        old = self.hill([(self.A, "Alpha", "x")], 3)
+        new = self.hill([(self.A, "Alpha", "x"), (self.B, "Beta", "y")], 3)
+        self.assertEqual(self.take(st, old, new, cfg=dict(self.CFG, commentary=False)), [])
+
+    def countdown(self, st, now):
+        sent = []
+        hill = self.hill([(self.A, "Alpha", "x"), (self.B, "Beta", "y")], 2)
+        with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append((path, doc)) or {"id": "x"}), \
+                mock.patch("hill_king.time.time", return_value=now):
+            hill_king.season_end(self.CFG, st, hill, True)
+        return [d["body"] for p, d in sent if p == "/v1/posts/c/replies"]
+
+    def full_st(self, full_at=1000, king_at=500):
+        return {"done": [], "king": self.A, "reign": {"king": self.A, "from": 1, "at": king_at},
+                "ends": {"3": {"full_at": full_at}}}
+
+    def test_a_day_of_an_unchanged_king_is_told_once(self):
+        st = self.full_st()
+        self.assertEqual(self.countdown(st, 1000 + 23 * self.H), [])
+        day1 = self.countdown(st, 1000 + 25 * self.H)
+        self.assertEqual(len(day1), 1)
+        self.assertIn("Alpha", day1[0])
+        self.assertIn("72", day1[0])  # 97 - 25 hours left
+        self.assertEqual(self.countdown(st, 1000 + 30 * self.H), [])
+        self.assertEqual(len(self.countdown(st, 1000 + 49 * self.H)), 1)
+
+    def test_a_new_king_restarts_the_days(self):
+        st = self.full_st()
+        self.countdown(st, 1000 + 25 * self.H)
+        st["reign"] = {"king": self.B, "from": 2, "at": 1000 + 30 * self.H}
+        self.assertEqual(self.countdown(st, 1000 + 40 * self.H), [])
+        self.assertEqual(len(self.countdown(st, 1000 + 55 * self.H)), 1)
+
+    def test_no_countdown_before_the_hill_is_full(self):
+        st = {"done": [], "king": self.A, "reign": {"king": self.A, "from": 1, "at": 500}}
+        self.assertEqual(self.countdown(st, 500 + 50 * self.H), [])

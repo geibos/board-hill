@@ -56,6 +56,14 @@ bash -lc читает общий ~/.profile. Повтор делает это н
                                   (тесты, ручная проверка; sha256 сверяется так же);
   "restore": false                не возвращать хилл машины к своей копии самому;
   "season_seq": N                 номер поста сезона: анонс короля ссылается на него;
+  "hold_hours": H                 конец сезона по правилу: хилл полон, и король держится
+                                  H часов, считая не раньше заполнения (freeze_at тогда —
+                                  крайний срок). Анонсер сам объявляет заморозку корневым
+                                  постом, ждёт раунд drand, пересчитывает итог своей копии
+                                  (`hill.sh final`) и публикует таблицу, хеши и кубок;
+  "commentary": true              комментатор в треде машины: каждый принятый вызов (кто
+                                  вошёл, кто ушёл и почему, король, места) и раз в сутки на
+                                  полном хилле — сколько держится король и сколько до заморозки;
   "rules": "<путь в repo>"        файл правил сезона (по умолчанию season<N>/RULES.md
                                   со второго сезона; у первого — нет).
 Анонс нового короля, кроме верха таблицы, говорит отрыв от второго места,
@@ -589,7 +597,7 @@ def state_save(st):
 
 
 def brief(j):
-    return {k: j.get(k) for k in ("job_id", "number", "actor", "started_at", "finished_at")}
+    return {k: j.get(k) for k in ("job_id", "number", "actor", "submitted_at", "started_at", "finished_at")}
 
 
 def take(cfg, st, hill, copy, j, post):
@@ -598,12 +606,15 @@ def take(cfg, st, hill, copy, j, post):
     которые он выдержал, — прибытия после этого."""
     path = os.path.join(hill, "state.json")
     old = load(path) if os.path.exists(path) else None
+    # Время события — подача задания с вызовом (как и граница заморозки).
+    when = j.get("submitted_at") or j.get("started_at") or int(time.time())
     if os.path.exists(hill):
         shutil.rmtree(hill)
     shutil.copytree(copy, hill)
     new = load(path)
     king = new["members"][0]["id"]
     print("задание %s: принято, король %s" % (j.get("number"), king))
+    crowned = king != st["king"]
     if king != st["king"]:
         prev = None
         if old and old["members"]:
@@ -614,9 +625,278 @@ def take(cfg, st, hill, copy, j, post):
         if post:
             r = announce(cfg, j, hill, prev=prev)
             print("  анонс:", r.get("id") or r)
-        st["reign"] = {"king": king, "from": new["next"]}
+        st["reign"] = {"king": king, "from": new["next"], "at": when}
     st["king"] = king
     st.pop("bad", None)
+    size = hill_size(hill)
+    if size and len(new["members"]) >= size:
+        ends(cfg, st).setdefault("full_at", when)
+    if post and cfg.get("commentary"):
+        r = comment(cfg, st, hill, old, new, j, crowned, when)
+        if r:
+            print("  комментарий:", r.get("id") or r)
+
+
+# Конец сезона по правилу (с третьего сезона): хилл полон, и король держится
+# hold_hours, считая не раньше заполнения; или крайний срок freeze_at.
+DRAND_GENESIS = 1692803367  # quicknet: раунд 1 — в этот момент, дальше каждые 3 с
+DRAND_PERIOD = 3
+
+
+def drand_round(t):
+    """Первый раунд drand quicknet строго после момента t."""
+    return (t - DRAND_GENESIS) // DRAND_PERIOD + 2
+
+
+def round_time(r):
+    return DRAND_GENESIS + (r - 1) * DRAND_PERIOD
+
+
+def hill_size(hill):
+    try:
+        with open(os.path.join(hill, "hill.toml")) as fh:
+            m = re.search(r"^size = (\d+)$", fh.read(), re.M)
+    except OSError:
+        return 0
+    return int(m.group(1)) if m else 0
+
+
+def ends(cfg, st):
+    """Записи о конце текущего сезона: full_at, notice, final."""
+    return st.setdefault("ends", {}).setdefault(str(int(cfg.get("season", 1))), {})
+
+
+def freeze_of(cfg, st):
+    """(момент заморозки, "rule" | "deadline") или (None, None)."""
+    out = []
+    if cfg.get("freeze_at"):
+        out.append((cfg["freeze_at"], "deadline"))
+    full = ((st.get("ends") or {}).get(str(int(cfg.get("season", 1)))) or {}).get("full_at")
+    if cfg.get("hold_hours") and full:
+        out.append((max(full, (st.get("reign") or {}).get("at") or 0) + int(cfg["hold_hours"] * 3600), "rule"))
+    return min(out) if out else (None, None)
+
+
+def when_text(t):
+    g = time.gmtime(t)
+    m = time.gmtime(t + 3 * 3600)
+    return "%d %s %d, %02d:%02d:%02d UTC (%02d:%02d МСК)" % (
+        g.tm_mday, MONTHS[g.tm_mon - 1], g.tm_year, g.tm_hour, g.tm_min, g.tm_sec, m.tm_hour, m.tm_min)
+
+
+SEASON_IS = {1: "первый", 2: "второй", 3: "третий", 4: "четвёртый", 5: "пятый", 6: "шестой", 7: "седьмой",
+             8: "восьмой", 9: "девятый", 10: "десятый"}
+
+
+def season_is(cfg):
+    season = int(cfg.get("season", 1))
+    return SEASON_IS.get(season, "%d-й" % season)
+
+
+def season_name(cfg):
+    season = int(cfg.get("season", 1))
+    return {1: "первого"}.get(season) or SEASON_OF.get(season, "%d-го" % season)
+
+
+def freeze_notice(cfg, st, hill, t, why, rnd):
+    members = load(os.path.join(hill, "state.json"))["members"]
+    e = ends(cfg, st)
+    if why == "rule":
+        reign = st.get("reign") or {}
+        cause = ("хилл полон (%d из %d) с %s, король **%s** (%s) не менялся с %s — %s часов, считая не "
+                 "раньше заполнения" % (len(members), hill_size(hill), when_text(e["full_at"]), members[0]["name"],
+                                        members[0]["author"], when_text(reign.get("at") or e["full_at"]),
+                                        cfg["hold_hours"]))
+    else:
+        cause = "наступил крайний срок сезона"
+    body = ("Хилл Core War, %s сезон, заморожен: **%s**.\n\nПричина: %s.\n\n"
+            "Задания, поданные с этого момента, в сезон не засчитываются, даже если доиграют позже. "
+            "Состав и таблица на заморозке:\n%s\n\n"
+            "Итог — пересчёт: каждая пара хилла играет %s раза на раскладках от значения drand (quicknet) "
+            "раунда **%d** (%s) — первого строго после заморозки. Анонсер посчитает итог сам, как только "
+            "значение выйдет, и опубликует таблицу, хеши и кубок партий. Проверить может каждый: "
+            "`bash hill.sh final %d` на снимке хилла." % (
+                season_is(cfg), when_text(t), cause, table(os.path.join(hill, "state.json"), rows=len(members)),
+                "32", rnd, when_text(round_time(rnd)), rnd))
+    title = "Хилл Core War: %s сезон заморожен" % season_is(cfg)
+    return request("/v1/posts", {"title": title[:160], "body": body, "topic": cfg.get("topic", "general")},
+                   idem="season-freeze-%s" % cfg.get("season", 1))
+
+
+def final_recount(cfg, hill, rnd):
+    """Итоговый пересчёт на своей копии: hill.sh сезона `final РАУНД` на всех ядрах."""
+    season = int(cfg.get("season", 1))
+    work = os.path.join(STATE_DIR, "season%d" % season)
+    os.makedirs(work, exist_ok=True)
+    script = os.path.join(work, "hill.sh")
+    with open(script, "w") as fh:
+        fh.write(season_script(cfg))
+    env = dict(os.environ, CW_ROOT=os.path.join(STATE_DIR, "cwroot"), HILL=hill,
+               FINAL_JOBS=str(os.cpu_count() or 1), FINAL_TIME_LIMIT="0",
+               FINAL_SAVE=os.path.join(work, "final-%d.txt" % rnd))
+    r = subprocess.run(["bash", script, "final", str(rnd)], env=env, capture_output=True, text=True, timeout=7200)
+    if r.returncode != 0 or "results sha256" not in r.stdout:
+        raise ValueError("пересчёт не досчитан: %s" % (r.stderr or r.stdout).strip()[-300:])
+    return r.stdout
+
+
+STRATEGY = re.compile(r"^;strategy(.*)$", re.M | re.I)
+
+
+def cup(rows, sources, parties):
+    """Кубок партий: за партию — боец, у которого имя или slug партии стоит в
+    строке ;strategy; зачёт — лучшее место. [(партия, id, место)] по местам."""
+    out = []
+    for p in parties:
+        names = [x.lower() for x in (p.get("name"), p.get("slug")) if x]
+        for r in sorted(rows, key=lambda r: r["place"]):
+            text = " ".join(STRATEGY.findall(sources.get(r["id"], ""))).lower()
+            if any(n in text for n in names):
+                out.append((p.get("name") or p.get("slug"), r["id"], r["place"]))
+                break
+    return sorted(out, key=lambda x: x[2])
+
+
+def final_post(cfg, hill, rnd, out, why, t):
+    lines = out.splitlines()
+    head = [l for l in lines if l.startswith(("drand quicknet round", "randomness", "seed ="))]
+    start = next(i for i, l in enumerate(lines) if l.startswith("  #    score"))
+    rows_text = [l for l in lines[start + 1:] if re.match(r"^\s*\d+\s", l)]
+    results = next(l for l in lines if l.startswith("results sha256"))
+    rows = [{"id": re.search(r"\[([0-9a-f]{16})\]$", l).group(1), "place": int(l.split()[0])}
+            for l in rows_text if re.search(r"\[([0-9a-f]{16})\]$", l)]
+    sources = {}
+    for r in rows:
+        try:
+            with open(os.path.join(hill, "warriors", r["id"] + ".red")) as fh:
+                sources[r["id"]] = fh.read()
+        except OSError:
+            pass
+    parties = request("/v1/parties?limit=100").get("items") or []
+    names = {r["id"]: l for r, l in zip(rows, rows_text)}
+    won = cup(rows, sources, parties)
+    sums = []
+    for f in ("hill.toml", "state.json", "results.json"):
+        with open(os.path.join(hill, f), "rb") as fh:
+            sums.append("%s %s" % (hashlib.sha256(fh.read()).hexdigest(), f))
+    king = re.sub(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+", "", rows_text[0]) if rows_text else "—"
+    cup_text = ("\n".join("- **%s**: %d-е место (%s)" % (n, place, re.sub(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+", "", names[i]))
+                          for n, i, place in won) if won else "ни у одного бойца в строке `;strategy` нет партии")
+    body = ("Итог %s сезона хилла Core War — пересчёт после заморозки (%s, %s).\n\n"
+            "Король сезона: **%s**.\n\n```\n%s\n%s\n```\n\n%s\n\n"
+            "Раунд drand **%d**; каждая пара сыграла 32 раза.\n```\n%s\n```\n\n"
+            "**Кубок партий** (партия в строке `;strategy`, лучшее место):\n%s\n\n"
+            "sha256 снимка хилла на заморозке:\n```\n%s\n```\n"
+            "Проверить: снимок, cw и `bash hill.sh final %d` дают ту же таблицу и тот же sha256 результатов." % (
+                season_name(cfg), when_text(t), "по правилу полного хилла" if why == "rule" else "по крайнему сроку",
+                king, lines[start], "\n".join(rows_text), results, rnd, "\n".join(head), cup_text, "\n".join(sums), rnd))
+    title = "Итог %s сезона хилла Core War: %s" % (season_name(cfg), king.split(" by ")[0])
+    return request("/v1/posts", {"title": title[:160], "body": body[:8000], "topic": cfg.get("topic", "general")},
+                   idem="season-final-%s" % cfg.get("season", 1))
+
+
+def season_end(cfg, st, hill, post):
+    """Заметить заморозку по правилу сезона, объявить её, а когда выйдет раунд
+    drand — пересчитать итог и опубликовать его. Каждое — один раз за сезон."""
+    if not post or not cfg.get("hold_hours"):
+        return
+    t, why = freeze_of(cfg, st)
+    if not t or time.time() < t:
+        if cfg.get("commentary"):
+            countdown(cfg, st, hill, t)
+        return
+    e = ends(cfg, st)
+    rnd = drand_round(t)
+    if not e.get("notice"):
+        r = freeze_notice(cfg, st, hill, t, why, rnd)
+        e.update(notice=r.get("id") or True, frozen_at=t, why=why, round=rnd)
+        print("сезон заморожен: %s, раунд %d" % (when_text(t), rnd))
+    if not e.get("final") and time.time() >= round_time(rnd) + 30:
+        out = final_recount(cfg, hill, rnd)
+        r = final_post(cfg, hill, rnd, out, why, t)
+        e["final"] = r.get("id") or True
+        print("итог сезона опубликован:", e["final"])
+
+
+# Комментатор (настройка commentary): ответы в треде машины на каждый принятый
+# вызов и раз в сутки — отсчёт бессменного короля на полном хилле.
+GONE = {"replaced by a new version": "заменён новой версией того же автора"}
+
+
+def gone_reason(reason):
+    if not reason:
+        return "вытеснен: хилл полон, а он слабейший"
+    if reason.startswith("per author"):
+        return "у автора больше трёх бойцов, ушёл слабейший из них"
+    return GONE.get(reason, reason)
+
+
+def comment(cfg, st, hill, old, new, j, crowned, when):
+    before = {m["id"] for m in (old or {}).get("members", [])}
+    after = {m["id"] for m in new["members"]}
+    entered = [m for m in new["members"] if m["id"] not in before]
+    left = [m for m in (old or {}).get("members", []) if m["id"] not in after]
+    if not entered and not left:
+        return None
+    sc = scores(hill)
+    place = {m["id"]: i + 1 for i, m in enumerate(new["members"])}
+    why = {}
+    try:
+        with open(os.path.join(hill, "history.jsonl")) as fh:
+            last = json.loads(fh.read().strip().splitlines()[-1])
+        why = {g.get("id"): g.get("reason") for g in last.get("pushed_off") or []}
+    except (OSError, IndexError, ValueError):
+        pass
+    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (m["name"], m["author"], place[m["id"]], sc[m["id"]])
+             for m in entered]
+    lines += ["Уходит **%s** (%s): %s." % (m["name"], m["author"], gone_reason(why.get(m["id"]))) for m in left]
+    k = new["members"][0]
+    size, n = hill_size(hill), len(new["members"])
+    t, reason = freeze_of(cfg, st)
+    full_at = ends(cfg, st).get("full_at")
+    if crowned:
+        lines.append("Новый король — **%s** (%s), %d %s%s." % (
+            k["name"], k["author"], sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
+            "; отсчёт %s часов начинается заново" % cfg["hold_hours"] if cfg.get("hold_hours") and full_at else ""))
+    else:
+        lead = sc[k["id"]] - sc[new["members"][1]["id"]] if n > 1 else sc[k["id"]]
+        lines.append("Король прежний — **%s** (%s), %d %s, отрыв от второго %d." % (
+            k["name"], k["author"], sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
+    if size and n >= size and full_at == when:
+        lines.append("Хилл заполнен: %d из %d. Пошёл отсчёт: если король продержится %s часов, сезон замёрзнет "
+                     "(%s)." % (n, size, cfg.get("hold_hours"), when_text(t)) if cfg.get("hold_hours") and t
+                     else "Хилл заполнен: %d из %d." % (n, size))
+    elif size and n >= size:
+        if cfg.get("hold_hours") and t:
+            lines.append("Хилл полон (%d из %d). Если никто не свергнет короля, заморозка — %s." % (n, size, when_text(t)))
+    elif size:
+        lines.append("На хилле %d из %d — до заполнения %d %s." % (n, size, size - n, plural(size - n, "место", "места", "мест")))
+    return request("/v1/posts/%s/replies" % cfg["computer"], {"body": " ".join(lines)},
+                   idem="hill-comment-" + str(j.get("job_id")))
+
+
+def countdown(cfg, st, hill, t):
+    """Раз в сутки на полном хилле: сколько держится король и сколько до заморозки."""
+    e = ends(cfg, st)
+    full = e.get("full_at")
+    if not cfg.get("hold_hours") or not full or e.get("notice"):
+        return
+    start = max(full, (st.get("reign") or {}).get("at") or 0)
+    now = time.time()
+    days = int((now - start) // 86400)
+    c = e.get("countdown") or {}
+    if c.get("start") != start:
+        c = {"start": start, "days": 0}
+    if days >= 1 and days > c["days"]:
+        k = load(os.path.join(hill, "state.json"))["members"][0]
+        body = ("Сутки %d: король **%s** (%s) держится на полном хилле %d ч из %s. Если его никто не свергнет, "
+                "сезон замёрзнет %s — осталось %d ч." % (
+                    days, k["name"], k["author"], int((now - start) // 3600), cfg["hold_hours"], when_text(t),
+                    max(0, int((t - now) // 3600))))
+        request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
+                idem="hill-countdown-%s-%d-%d" % (cfg.get("season", 1), start, days))
+        c["days"] = days
+    e["countdown"] = c
 
 
 def author_of(cfg, t, pending):
@@ -752,7 +1032,6 @@ def once(post=True):
     hill = hill_dir(cfg)
     canon = canonical(cfg)
     reading = sync_cmd(cfg)
-    freeze = cfg.get("freeze_at")
     done = set(st["done"])
     st.setdefault("sync", [])
     busy = False
@@ -770,6 +1049,7 @@ def once(post=True):
         done.add(jid)
         if (j.get("command") or "") == reading:
             continue
+        freeze = freeze_of(cfg, st)[0]
         if freeze and (j.get("submitted_at") or 0) >= freeze:
             print("задание %s подано после заморозки сезона, не считается" % j.get("number"))
             continue
@@ -790,6 +1070,7 @@ def once(post=True):
         state_save(st)
     st["done"] = sorted(done)
     state_save(st)
+    freeze = freeze_of(cfg, st)[0]
     if freeze and time.time() >= freeze:
         # После заморозки хилл машины может меняться как угодно: сезон закрыт.
         st["sync"] = []
@@ -806,6 +1087,11 @@ def once(post=True):
             st["restore"] = st.get("restore") or st.get("bad")
             print("откат не сделан сейчас: %s; повтор на следующем проходе" % e)
         state_save(st)
+    try:
+        season_end(cfg, st, hill, post)
+    except (board.BoardError, OSError, ValueError, subprocess.SubprocessError, http.client.HTTPException) as e:
+        print("конец сезона не оформлен сейчас: %s; повтор на следующем проходе" % e)
+    state_save(st)
     refresh(cfg, hill)
 
 
