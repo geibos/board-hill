@@ -1037,16 +1037,19 @@ def once(post=True):
     done = set(st["done"])
     st.setdefault("sync", [])
     busy = False
+    unresolved = []  # время подачи незавершённых заданий
     for item in sorted(jobs(cfg), key=lambda x: x.get("number") or 0):
         jid = item["job_id"]
         if jid in done:
             continue
         if item.get("state") in ("queued", "running"):
             busy = True
+            unresolved.append(item.get("submitted_at") or 0)
             continue
         j = job(cfg, jid)
         if j.get("state") in ("queued", "running"):
             busy = True
+            unresolved.append(j.get("submitted_at") or item.get("submitted_at") or 0)
             continue
         done.add(jid)
         if (j.get("command") or "") == reading:
@@ -1090,9 +1093,12 @@ def once(post=True):
             print("откат не сделан сейчас: %s; повтор на следующем проходе" % e)
         state_save(st)
     try:
-        # Пока задание идёт или хилл машины не догнан, состояние ещё может
-        # сдвинуть момент заморозки: конец сезона не объявляется.
-        if not busy and not st.get("sync"):
+        # Пока идёт задание, поданное до момента заморозки, или хилл машины не
+        # догнан, состояние ещё может сдвинуть этот момент: конец сезона не
+        # объявляется. Задания, поданные позже, не засчитываются и держать конец
+        # не могут: иначе любой ветеран тянул бы сезон бесконечно, занимая машину.
+        t = freeze_of(cfg, st)[0]
+        if not any(t is None or s < t for s in unresolved) and not st.get("sync"):
             season_end(cfg, st, hill, post)
     except (board.BoardError, OSError, ValueError, subprocess.SubprocessError, http.client.HTTPException) as e:
         print("конец сезона не оформлен сейчас: %s; повтор на следующем проходе" % e)

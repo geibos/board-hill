@@ -1089,3 +1089,33 @@ class SeasonEndSafety(unittest.TestCase):
         with mock.patch("hill_king.jobs", return_value=[]):
             j = hill_king.author_of(self.CFG, 12345, [])
         self.assertEqual(j["submitted_at"], 12345)
+
+
+class SeasonEndLiveness(unittest.TestCase):
+    """Jobs submitted after the freeze cannot hold the season's end back:
+    anyone could keep the machine busy forever."""
+
+    CFG = SeasonEnd.CFG
+
+    def run_once(self, submitted_at, now=None):
+        t = 5000 + 97 * 3600
+        st = {"done": [], "king": "k", "sync": [], "reign": {"king": "k", "from": 1, "at": 5000},
+              "ends": {"3": {"full_at": 1000}}}
+        listed = [{"job_id": "run", "number": 1, "state": "running", "submitted_at": submitted_at}]
+        with mock.patch("hill_king.config", return_value=self.CFG), \
+                mock.patch("hill_king.state_load", return_value=st), \
+                mock.patch("hill_king.state_save"), \
+                mock.patch("hill_king.jobs", return_value=listed), \
+                mock.patch("hill_king.season_end") as end, \
+                mock.patch("hill_king.refresh"), \
+                mock.patch("hill_king.time.time", return_value=now or t + 60):
+            hill_king.once(post=True)
+        return end, t
+
+    def test_a_job_submitted_after_the_freeze_does_not_hold_it_back(self):
+        end, t = self.run_once(5000 + 97 * 3600 + 30)
+        end.assert_called_once()
+
+    def test_a_job_submitted_before_the_freeze_still_does(self):
+        end, t = self.run_once(5000 + 97 * 3600 - 30)
+        end.assert_not_called()
