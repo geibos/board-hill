@@ -190,9 +190,22 @@ def request(path, payload=None, idem=None):
     return data
 
 
-def jobs(cfg, limit=20):
-    d = request("/v1/computers/%s/jobs?limit=%d" % (cfg["computer"], limit))
-    return d.get("jobs") or d.get("items") or []
+def jobs(cfg, limit=20, since=None):
+    """Задания машины, новые первыми. С since — страницами назад, пока не дойдёт
+    до поданных раньше since (не больше 100 страниц): поток поздних заданий не
+    вытесняет из окна те, что поданы раньше."""
+    if since is None:
+        d = request("/v1/computers/%s/jobs?limit=%d" % (cfg["computer"], limit))
+        return d.get("jobs") or d.get("items") or []
+    out, before = [], None
+    for _ in range(100):
+        d = request("/v1/computers/%s/jobs?limit=30%s" % (cfg["computer"], "&before=%d" % before if before else ""))
+        items = d.get("jobs") or d.get("items") or []
+        out += items
+        if not items or min(x.get("submitted_at") or 0 for x in items) < since or not d.get("next_before"):
+            break
+        before = d["next_before"]
+    return out
 
 
 def job(cfg, job_id):
@@ -1038,7 +1051,13 @@ def once(post=True):
     st.setdefault("sync", [])
     busy = False
     unresolved = []  # время подачи незавершённых заданий
-    for item in sorted(jobs(cfg), key=lambda x: x.get("number") or 0):
+    # Окно заданий: два часа назад (дольше задание на машине не живёт), а пока
+    # итог сезона не опубликован — и два часа до момента заморозки.
+    horizon = time.time() - 2 * 3600
+    t0 = freeze_of(cfg, st)[0]
+    if t0 and cfg.get("hold_hours") and not ends(cfg, st).get("final"):
+        horizon = min(horizon, t0 - 2 * 3600)
+    for item in sorted(jobs(cfg, since=horizon), key=lambda x: x.get("number") or 0):
         jid = item["job_id"]
         if jid in done:
             continue

@@ -1119,3 +1119,38 @@ class SeasonEndLiveness(unittest.TestCase):
     def test_a_job_submitted_before_the_freeze_still_does(self):
         end, t = self.run_once(5000 + 97 * 3600 - 30)
         end.assert_not_called()
+
+
+class JobWindow(unittest.TestCase):
+    """The announcer sees every job back to its horizon, not just the newest
+    page: a flood of later jobs must not hide one submitted before the freeze."""
+
+    def test_jobs_are_paged_back_to_the_horizon(self):
+        pages = {None: {"jobs": [{"job_id": "a", "submitted_at": 900}, {"job_id": "b", "submitted_at": 800}],
+                        "next_before": 2},
+                 2: {"jobs": [{"job_id": "c", "submitted_at": 700}, {"job_id": "d", "submitted_at": 400}],
+                     "next_before": 1},
+                 1: {"jobs": [{"job_id": "e", "submitted_at": 100}], "next_before": None}}
+
+        def req(path, payload=None, idem=None):
+            m = re.search(r"before=(\d+)", path)
+            return pages[int(m.group(1)) if m else None]
+        import re
+        with mock.patch("hill_king.request", side_effect=req):
+            got = hill_king.jobs({"computer": "c"}, since=500)
+        self.assertEqual([j["job_id"] for j in got], ["a", "b", "c", "d"])
+
+    def test_once_looks_back_two_hours_before_the_freeze(self):
+        cfg = SeasonEnd.CFG
+        t = 5000 + 97 * 3600
+        st = {"done": [], "king": "k", "sync": [], "reign": {"king": "k", "from": 1, "at": 5000},
+              "ends": {"3": {"full_at": 1000}}}
+        with mock.patch("hill_king.config", return_value=cfg), \
+                mock.patch("hill_king.state_load", return_value=st), \
+                mock.patch("hill_king.state_save"), \
+                mock.patch("hill_king.jobs", return_value=[]) as jobs, \
+                mock.patch("hill_king.season_end"), \
+                mock.patch("hill_king.refresh"), \
+                mock.patch("hill_king.time.time", return_value=t + 10 * 3600):
+            hill_king.once(post=True)
+        self.assertLessEqual(jobs.call_args.kwargs["since"], t - 2 * 3600)
