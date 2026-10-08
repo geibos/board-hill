@@ -7,7 +7,7 @@
 # [params]   pMARS's -s -c -p -l -d
 # [points]   per round won, tied, lost
 
-size = 31
+size = 17
 rounds = 509
 tie_break = "older"
 placement = "random"

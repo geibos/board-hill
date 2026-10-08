@@ -36,8 +36,8 @@
 # SHA-256 of the round's signature, and replays every pair of the hill
 # FINAL_RUNS times with `cw pair`, placements from
 # sha256("RANDOMNESS:RULES_SHA256:ROSTER_SHA256"). It changes nothing in the
-# hill; the same round gives everyone the same table. 31 members and 32 runs
-# are about 15 000 matches, some three hours of the machine's one CPU, so
+# hill; the same round gives everyone the same table. 17 members and 32 runs
+# are about 4 400 matches, about an hour of the machine's one CPU, so
 # each job stops after FINAL_TIME_LIMIT seconds (3000) with its progress in
 # final-ROUND.txt next to the hill, and the same command, run again in the
 # next session, goes on. FINAL_JOBS runs that many matches at once, for a
@@ -56,8 +56,8 @@ declare -A SUMS=(
 # season3/hill.toml, as `cw hill init` writes it with these rules: every
 # parameter a prime.
 PARAMS="-s 8191 -c 65521 -p 8191 -l 127 -d 127"
-RULES="--size 31 --rounds 509 --placement random $PARAMS"
-RULES_SUM=1ae49a2bcd49da4972c40ef5aad95d202ea365538db1f6be99c7693b7f23f56b
+RULES="--size 17 --rounds 509 --placement random $PARAMS"
+RULES_SUM=3d5de86237feaccda5027b731f4ebfa98df7218bbecbd071221523bda27e2a50
 # The hill's own rules, on top of cw's: a warrior whose assembled code (the
 # output of `cw list`) is on the hill already is refused, and an author (the
 # `;author` line) has at most PER_AUTHOR warriors on the hill (0: no limit):
