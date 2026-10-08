@@ -27,8 +27,10 @@ def read(path, mode="r"):
 
 @unittest.skipUnless(os.path.exists(CW), "needs cw")
 class SeasonTwoRules(unittest.TestCase):
+    SEASON = "season2"
+
     def setUp(self):
-        self.script = read(os.path.join(HERE, "season2", "hill.sh"))
+        self.script = read(os.path.join(HERE, self.SEASON, "hill.sh"))
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp)
 
@@ -45,10 +47,26 @@ class SeasonTwoRules(unittest.TestCase):
         self.assertEqual(hashlib.sha256(self.made()).hexdigest(), self.var("RULES_SUM"))
 
     def test_the_published_copy_is_the_pinned_rules(self):
-        self.assertEqual(read(os.path.join(HERE, "season2", "hill.toml"), "rb"), self.made())
+        self.assertEqual(read(os.path.join(HERE, self.SEASON, "hill.toml"), "rb"), self.made())
 
     def test_matches_are_placed_at_random(self):
         self.assertIn(b'placement = "random"', self.made())
+
+
+@unittest.skipUnless(os.path.exists(CW), "needs cw")
+class SeasonThreeRules(SeasonTwoRules):
+    SEASON = "season3"
+
+    def test_every_parameter_is_a_prime(self):
+        def prime(n):
+            return n > 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))
+        made = self.made().decode()
+        for key in ("size", "rounds", "core_size", "cycles", "processes", "length", "distance"):
+            n = int(re.search(r"^%s = (\d+)$" % key, made, re.M).group(1))
+            self.assertTrue(prime(n), (key, n))
+
+    def test_the_season_number(self):
+        self.assertEqual(self.var("SEASON"), "3")
 
 
 if __name__ == "__main__":
