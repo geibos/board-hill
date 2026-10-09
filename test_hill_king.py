@@ -1248,3 +1248,37 @@ class MachineRule(unittest.TestCase):
             new = hill_king.police(dict(self.CFG, machine_rule_from=None), {})
         self.assertEqual(new, [])
         act.assert_not_called()
+
+
+class NoInjection(unittest.TestCase):
+    """What others write (a job's command, a warrior's ;name) never reaches the
+    announcer's posts as markup, links, mentions or extra lines."""
+
+    EVIL = "Evil**\n@everyone [x](http://e.vil) `code` #1"
+
+    def test_plain_strips_markup_mentions_and_lines(self):
+        p = hill_king.plain(self.EVIL)
+        for bad in ("\n", "@everyone", "**", "[x](", "`", "http://"):
+            self.assertNotIn(bad, p)
+        self.assertLessEqual(len(hill_king.plain("x" * 500)), 60)
+
+    def test_a_violation_names_the_job_not_its_command(self):
+        x = {"seq": 1, "at": 2000, "type": "job_submitted", "actor": "v", "job_id": "j1",
+             "summary": "Submitted job #269.", "detail": {"command": "echo @everyone **pwn**"}}
+        with mock.patch("hill_king.activity", return_value=[x]), mock.patch("hill_king.own_jobs", return_value=set()):
+            st = {}
+            hill_king.police(MachineRule.CFG, st)
+        why = st["machine_rule"]["3"]["bad"]["v"]["why"]
+        self.assertIn("№269", why)
+        self.assertNotIn("@everyone", why)
+        self.assertNotIn("pwn", why)
+
+    def test_a_comment_carries_no_foreign_markup(self):
+        c = Commentary()
+        c.setUp = lambda: None
+        old = Commentary.hill(c, [("a" * 16, "Alpha", "x")], 3)
+        new = Commentary.hill(c, [("a" * 16, "Alpha", "x"), ("b" * 16, self.EVIL, "y")], 3)
+        out = Commentary.take(c, {"done": [], "king": "a" * 16}, old, new)
+        self.assertNotIn("@everyone", out[0])
+        self.assertNotIn("http://", out[0])
+        self.assertEqual(out[0].count("\n"), 0)

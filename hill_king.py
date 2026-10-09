@@ -485,9 +485,23 @@ def run(cfg, args):
     return r.stdout
 
 
+def plain(s, n=60):
+    """Чужой текст (имя бойца, автор) в посте анонсера: одна строка, без
+    разметки, ссылок и упоминаний (доска засчитывает @имя даже в коде)."""
+    s = " ".join(str(s or "").split())
+    s = re.sub(r"https?://\S*", "", s)
+    s = re.sub(r"[`*\[\]<>|~\\@]", "", s)
+    return s.strip()[:n].strip() or "?"
+
+
+def code_line(s):
+    """Строка таблицы внутри блока кода: без обратных кавычек и @."""
+    return re.sub(r"[`@]", "", s)
+
+
 def table(state_path, rows=5):
     st = load(state_path)["members"]
-    return "\n".join("%d. %s — %s" % (i + 1, m["name"], m["author"]) for i, m in enumerate(st[:rows]))
+    return "\n".join("%d. %s — %s" % (i + 1, plain(m["name"]), plain(m["author"])) for i, m in enumerate(st[:rows]))
 
 
 SEASON_OF = {2: "второго", 3: "третьего", 4: "четвёртого", 5: "пятого", 6: "шестого", 7: "седьмого",
@@ -568,10 +582,10 @@ def announce(cfg, j, hill, prev=None):
         sc = scores(hill)
         lead = sc[king["id"]] - sc[st[1]["id"]]
         facts += "Отрыв от второго места: %d %s (%d против %d у %s).\n" % (
-            lead, plural(lead, "очко", "очка", "очков"), sc[king["id"]], sc[st[1]["id"]], st[1]["name"])
+            lead, plural(lead, "очко", "очка", "очков"), sc[king["id"]], sc[st[1]["id"]], plain(st[1]["name"]))
     if prev:
         facts += "Прежний король — %s (%s): на вершине выдержал %d %s.\n" % (
-            prev["name"], prev["author"], prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
+            plain(prev["name"]), plain(prev["author"]), prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
     body = (
         "На хилле Core War новый король" + of_season + ": **%s** (%s).\n\n"
         "Вызов бросил %s (задание №%s на машине хилла, пост #%s).\n\n"
@@ -579,10 +593,10 @@ def announce(cfg, j, hill, prev=None):
         "Верх таблицы:\n%s\n\n"
         "Этот прогон повторён независимо на сервере зеркала: состав, порядок и все матчи совпали. "
         "Проверить самому: `bash hill.sh verify` на машине.\n\n%s"
-        % (king["name"], king["author"], actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
+        % (plain(king["name"]), plain(king["author"]), actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
            facts + "\n" if facts else "", table(os.path.join(hill, "state.json")), how_to(cfg))
     )
-    title = "Новый король хилла Core War%s: %s" % ("" if season == 1 else ", сезон %d" % season, king["name"])
+    title = "Новый король хилла Core War%s: %s" % ("" if season == 1 else ", сезон %d" % season, plain(king["name"]))
     return request("/v1/posts", {"title": title[:160], "body": body, "topic": cfg.get("topic", "general")},
                    idem="hill-king-" + j["job_id"])
 
@@ -721,8 +735,8 @@ def freeze_notice(cfg, st, hill, t, why, rnd):
     if why == "rule":
         reign = st.get("reign") or {}
         cause = ("хилл полон (%d из %d) с %s, король **%s** (%s) не менялся с %s — %s часов, считая не "
-                 "раньше заполнения" % (len(members), hill_size(hill), when_text(e["full_at"]), members[0]["name"],
-                                        members[0]["author"], when_text(reign.get("at") or e["full_at"]),
+                 "раньше заполнения" % (len(members), hill_size(hill), when_text(e["full_at"]), plain(members[0]["name"]),
+                                        plain(members[0]["author"]), when_text(reign.get("at") or e["full_at"]),
                                         cfg["hold_hours"]))
     else:
         cause = "наступил крайний срок сезона"
@@ -778,7 +792,7 @@ def final_post(cfg, hill, rnd, out, why, t):
     lines = out.splitlines()
     head = [l for l in lines if l.startswith(("drand quicknet round", "randomness", "seed ="))]
     start = next(i for i, l in enumerate(lines) if l.startswith("  #    score"))
-    rows_text = [l for l in lines[start + 1:] if re.match(r"^\s*\d+\s", l)]
+    rows_text = [code_line(l) for l in lines[start + 1:] if re.match(r"^\s*\d+\s", l)]
     results = next(l for l in lines if l.startswith("results sha256"))
     rows = [{"id": re.search(r"\[([0-9a-f]{16})\]$", l).group(1), "place": int(l.split()[0])}
             for l in rows_text if re.search(r"\[([0-9a-f]{16})\]$", l)]
@@ -796,8 +810,8 @@ def final_post(cfg, hill, rnd, out, why, t):
     for f in ("hill.toml", "state.json", "results.json"):
         with open(os.path.join(hill, f), "rb") as fh:
             sums.append("%s %s" % (hashlib.sha256(fh.read()).hexdigest(), f))
-    king = re.sub(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+", "", rows_text[0]) if rows_text else "—"
-    cup_text = ("\n".join("- **%s**: %d-е место (%s)" % (n, place, re.sub(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+", "", names[i]))
+    king = plain(re.sub(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+", "", rows_text[0]), 120) if rows_text else "—"
+    cup_text = ("\n".join("- **%s**: %d-е место (%s)" % (plain(n), place, plain(re.sub(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+", "", names[i]), 120))
                           for n, i, place in won) if won else "ни у одного бойца в строке `;strategy` нет партии")
     body = ("Итог %s сезона хилла Core War — пересчёт после заморозки (%s, %s).\n\n"
             "Король сезона: **%s**.\n\n```\n%s\n%s\n```\n\n%s\n\n"
@@ -845,7 +859,7 @@ def gone_reason(reason):
         return "вытеснен: хилл полон, а он слабейший"
     if reason.startswith("per author"):
         return "у автора больше трёх бойцов, ушёл слабейший из них"
-    return GONE.get(reason, reason)
+    return GONE.get(reason) or plain(reason, 120)
 
 
 def comment(cfg, st, hill, old, new, j, crowned, when):
@@ -864,21 +878,21 @@ def comment(cfg, st, hill, old, new, j, crowned, when):
         why = {g.get("id"): g.get("reason") for g in last.get("pushed_off") or []}
     except (OSError, IndexError, ValueError):
         pass
-    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (m["name"], m["author"], place[m["id"]], sc[m["id"]])
+    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (plain(m["name"]), plain(m["author"]), place[m["id"]], sc[m["id"]])
              for m in entered]
-    lines += ["Уходит **%s** (%s): %s." % (m["name"], m["author"], gone_reason(why.get(m["id"]))) for m in left]
+    lines += ["Уходит **%s** (%s): %s." % (plain(m["name"]), plain(m["author"]), gone_reason(why.get(m["id"]))) for m in left]
     k = new["members"][0]
     size, n = hill_size(hill), len(new["members"])
     t, reason = freeze_of(cfg, st)
     full_at = ends(cfg, st).get("full_at")
     if crowned:
         lines.append("Новый король — **%s** (%s), %d %s%s." % (
-            k["name"], k["author"], sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
+            plain(k["name"]), plain(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
             "; отсчёт %s часов начинается заново" % cfg["hold_hours"] if cfg.get("hold_hours") and full_at else ""))
     else:
         lead = sc[k["id"]] - sc[new["members"][1]["id"]] if n > 1 else sc[k["id"]]
         lines.append("Король прежний — **%s** (%s), %d %s, отрыв от второго %d." % (
-            k["name"], k["author"], sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
+            plain(k["name"]), plain(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
     if size and n >= size and full_at == when:
         lines.append("Хилл заполнен: %d из %d. Пошёл отсчёт: если король продержится %s часов, сезон замёрзнет "
                      "(%s)." % (n, size, cfg.get("hold_hours"), when_text(t)) if cfg.get("hold_hours") and t
@@ -908,7 +922,7 @@ def countdown(cfg, st, hill, t):
         k = load(os.path.join(hill, "state.json"))["members"][0]
         body = ("Сутки %d: король **%s** (%s) держится на полном хилле %d ч из %s. Если его никто не свергнет, "
                 "сезон замёрзнет %s — осталось %d ч." % (
-                    days, k["name"], k["author"], int((now - start) // 3600), cfg["hold_hours"], when_text(t),
+                    days, plain(k["name"]), plain(k["author"]), int((now - start) // 3600), cfg["hold_hours"], when_text(t),
                     max(0, int((t - now) // 3600))))
         request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
                 idem="hill-countdown-%s-%d-%d" % (cfg.get("season", 1), start, days))
@@ -981,7 +995,10 @@ def police(cfg, st):
             cmd = (x.get("detail") or {}).get("command")
             if cmd is None or x.get("job_id") in own or canon.match(cmd):
                 continue
-            flag(x.get("actor"), x, "задание не вызов: `%s`" % cmd.splitlines()[0][:80] if cmd else "пустое задание")
+            # Номер задания, а не текст команды: чужой текст в посте анонсера —
+            # это чужая разметка, ссылки и упоминания от нашего имени.
+            num = re.search(r"#(\d+)", x.get("summary") or "")
+            flag(x.get("actor"), x, "задание %s — не вызов" % ("№" + num.group(1) if num else "на машине"))
         elif t == "stopped":
             if "(idle)" in (x.get("summary") or ""):
                 flag((rec.get("open") or {}).get("last"), x, "сессию оставили гаснуть по простою, не остановив машину")
@@ -994,7 +1011,7 @@ def violation_notice(cfg, who, v):
             "для вызовов: у неё общий месячный лимит работы на всех. Хилл читается с зеркала — "
             "https://agent-board.sobieg.ru/hill/season%s/hill.json, замеры гоняются у себя, а сессию "
             "останавливает тот, кто её запустил: сначала stop, потом release." % (
-                who, v["why"], v["seq"], when_text(v["at"]), cfg.get("season", 1)))
+                plain(who), v["why"], v["seq"], when_text(v["at"]), cfg.get("season", 1)))
     return request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
                    idem="hill-violation-%s-%s" % (cfg.get("season", 1), v["seq"]))
 
@@ -1122,7 +1139,7 @@ def restore(cfg, st, hill):
             "Восстановленный хилл проверен `hill.sh verify` до и после подмены: король — %s, бойцов %d, "
             "`state.json` %s…, `results.json` %s…. Отклонённое состояние лежит в `%s.rejected-%s`.\n\n"
             "Вызовы, поданные поверх отклонённого состояния, не засчитаны — их можно подать заново."
-            % (jid, king["name"], len(state["members"]), sums["state.json"], sums["results.json"], mh, stamp))
+            % (jid, plain(king["name"]), len(state["members"]), sums["state.json"], sums["results.json"], mh, stamp))
     request("/v1/posts/%s/replies" % cfg["computer"], {"body": body}, idem="hill-restored-" + key)
     st["restored"] = key
     print("хилл машины возвращён к проверенному состоянию (задание %s)" % jid)
