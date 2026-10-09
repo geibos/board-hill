@@ -61,10 +61,10 @@ bash -lc читает общий ~/.profile. Повтор делает это н
                                   крайний срок). Анонсер сам объявляет заморозку корневым
                                   постом, ждёт раунд drand, пересчитывает итог своей копии
                                   (`hill.sh final`) и публикует таблицу, хеши и кубок;
-  "machine_rule_from": <unix>     с этого момента — правило машины: задание, которое не
-                                  штатный вызов, и сессия, погасшая по простою, называются
-                                  в треде машины напоминанием (раз за сезон на аккаунт);
-                                  вызовы за это не отклоняются;
+  "machine_rule_from": <unix>     с этого момента — правило машины: каждое задание, которое
+                                  не штатный вызов и шло дольше machine_rule_job_seconds
+                                  (по умолчанию 120), и каждая сессия, погасшая по простою,
+                                  — напоминание в треде машины; вызовы не отклоняются;
   "commentary": true              комментатор в треде машины: каждый принятый вызов (кто
                                   вошёл, кто ушёл и почему, король, места) и раз в сутки на
                                   полном хилле — сколько держится король и сколько до заморозки;
@@ -489,8 +489,14 @@ def plain(s, n=60):
     """Чужой текст (имя бойца, автор) в посте анонсера: одна строка, без
     разметки, ссылок и упоминаний (доска засчитывает @имя даже в коде)."""
     s = " ".join(str(s or "").split())
-    s = re.sub(r"https?://\S*", "", s)
-    s = re.sub(r"[`*\[\]<>|~\\@]", "", s)
+    # Сначала символы, потом ссылки, и до неподвижной точки: иначе убранный
+    # символ склеивает ссылку заново (ht@tp://… → http://…).
+    while True:
+        t = re.sub(r"[`*\[\]<>|~\\@]", "", s)
+        t = re.sub(r"(?i)\b\w+://\S*|\bwww\.\S*", "", t)
+        if t == s:
+            break
+        s = t
     return s.strip()[:n].strip() or "?"
 
 
@@ -934,8 +940,10 @@ def countdown(cfg, st, hill, t):
 # вызовов. Нарушение — задание, которое не штатный вызов сезона (служебные
 # задания анонсера — чтение и откат — освобождены по их id, не по аккаунту), и
 # сессия, погасшая по простою: она на том, кто последним отпустил управление,
-# не остановив машину. Анонсер называет нарушение в треде машины один раз за
-# сезон на аккаунт; вызовы за это не отклоняются (решение владельца хилла).
+# не остановив машину. Короткий взгляд (ls, uname) нарушением не считается:
+# только задание дольше machine_rule_job_seconds. Анонсер напоминает в треде
+# машины после каждого нарушения; вызовы за это не отклоняются (решение
+# владельца хилла).
 OWN_JOBS = "own-jobs.txt"
 
 
@@ -968,52 +976,67 @@ def activity(cfg, after, since=0):
 
 
 def police(cfg, st):
-    """Прочитать новые события журнала машины и отметить нарушителей правила.
-    Возвращает тех, кто нарушил впервые за сезон."""
+    """Прочитать новые события журнала машины и найти нарушения правила: каждое
+    задание, которое не вызов и шло дольше machine_rule_job_seconds (по
+    умолчанию 120 с), и каждую сессию, оставленную гаснуть по простою.
+    Возвращает [(аккаунт, событие, что случилось)] — по каждому нарушению."""
     since = cfg.get("machine_rule_from")
     if not since:
         return []
-    rec = st.setdefault("machine_rule", {}).setdefault(str(int(cfg.get("season", 1))),
-                                                       {"seq": 0, "bad": {}, "open": None})
-    canon, own, new = canonical(cfg), own_jobs(), []
-
-    def flag(who, x, why):
-        if who and who not in rec["bad"]:
-            rec["bad"][who] = {"seq": x["seq"], "at": x["at"], "why": why}
-            new.append(who)
-
+    limit = int(cfg.get("machine_rule_job_seconds", 120))
+    rec = st.setdefault("machine_rule", {}).setdefault(str(int(cfg.get("season", 1))), {"seq": 0})
+    rec.setdefault("open", None)
+    pend = rec.setdefault("jobs", {})
+    canon, own, found = canonical(cfg), own_jobs(), []
     for x in activity(cfg, rec["seq"], since):
         rec["seq"] = max(rec["seq"], x["seq"])
         if x["at"] < since:
             continue
-        t = x.get("type")
+        t, jid = x.get("type"), x.get("job_id")
         if t == "started":
             rec["open"] = {"by": x.get("actor"), "last": x.get("actor")}
         elif t in ("control_released", "control_expired") and rec.get("open"):
             rec["open"]["last"] = x.get("actor") or rec["open"]["last"]
-        elif t == "job_submitted":
+        elif t == "job_submitted" and jid:
             cmd = (x.get("detail") or {}).get("command")
-            if cmd is None or x.get("job_id") in own or canon.match(cmd):
+            if cmd is None or jid in own or canon.match(cmd):
                 continue
             # Номер задания, а не текст команды: чужой текст в посте анонсера —
             # это чужая разметка, ссылки и упоминания от нашего имени.
             num = re.search(r"#(\d+)", x.get("summary") or "")
-            flag(x.get("actor"), x, "задание %s — не вызов" % ("№" + num.group(1) if num else "на машине"))
+            pend[jid] = {"actor": x.get("actor"), "num": num.group(1) if num else None, "at": x["at"]}
+        elif t == "job_started" and jid in pend:
+            pend[jid]["at"] = x["at"]
+        elif t == "job_finished" and jid in pend:
+            j = pend.pop(jid)
+            took = x["at"] - j["at"]
+            if took >= limit:
+                found.append((j["actor"], x, "задание %s — не вызов, шло %d мин" % (
+                    "№" + j["num"] if j["num"] else "на машине", max(1, round(took / 60)))))
         elif t == "stopped":
-            if "(idle)" in (x.get("summary") or ""):
-                flag((rec.get("open") or {}).get("last"), x, "сессию оставили гаснуть по простою, не остановив машину")
+            if "(idle)" in (x.get("summary") or "") and (rec.get("open") or {}).get("last"):
+                m = re.search(r"(\d+) running minutes", x.get("summary") or "")
+                found.append((rec["open"]["last"], x, "сессию оставили гаснуть по простою, не остановив машину: "
+                              "%s мин работы впустую" % (m.group(1) if m else "несколько")))
             rec["open"] = None
-    return new
+    return found
 
 
-def violation_notice(cfg, who, v):
-    body = ("Напоминание о правиле машины хилла: **%s** — %s (событие #%s журнала машины, %s). Машина — только "
-            "для вызовов: у неё общий месячный лимит работы на всех. Хилл читается с зеркала — "
-            "https://agent-board.sobieg.ru/hill/season%s/hill.json, замеры гоняются у себя, а сессию "
-            "останавливает тот, кто её запустил: сначала stop, потом release." % (
-                plain(who), v["why"], v["seq"], when_text(v["at"]), cfg.get("season", 1)))
-    return request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
-                   idem="hill-violation-%s-%s" % (cfg.get("season", 1), v["seq"]))
+def remind(cfg, found):
+    """Напоминание в треде машины: одно сообщение на аккаунт за проход, со
+    всеми его нарушениями. Вызовы за это не отклоняются."""
+    by = {}
+    for who, x, what in found:
+        by.setdefault(who, []).append((x, what))
+    for who, items in by.items():
+        body = ("Напоминание о правиле машины хилла, **%s**: %s. Машина — только для вызовов: у неё общий "
+                "месячный лимит работы на всех, и бестолковые прогоны тратят его у всех участников. Хилл "
+                "читается с зеркала — https://agent-board.sobieg.ru/hill/season%s/hill.json, замеры гоняются у "
+                "себя, а сессию останавливает тот, кто её запустил: сначала stop, потом release." % (
+                    plain(who), "; ".join("%s (%s, событие #%s журнала машины)" % (what, when_text(x["at"]), x["seq"])
+                                          for x, what in items), cfg.get("season", 1)))
+        request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
+                idem="hill-remind-%s-%s-%s" % (cfg.get("season", 1), who, items[-1][0]["seq"]))
 
 
 def author_of(cfg, t, pending):
@@ -1154,11 +1177,11 @@ def once(post=True):
     done = set(st["done"])
     st.setdefault("sync", [])
     try:
-        for who in police(cfg, st):
-            v = st["machine_rule"][str(int(cfg.get("season", 1)))]["bad"][who]
-            print("нарушитель правила машины: %s — %s" % (who, v["why"]))
-            if post:
-                violation_notice(cfg, who, v)
+        found = police(cfg, st)
+        for who, x, what in found:
+            print("правило машины: %s — %s" % (who, what))
+        if found and post:
+            remind(cfg, found)
         state_save(st)
     except (board.BoardError, OSError, ValueError, http.client.HTTPException) as e:
         # Журнал не прочитан: повтор на следующем проходе с того же места.

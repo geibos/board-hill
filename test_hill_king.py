@@ -1157,11 +1157,12 @@ class JobWindow(unittest.TestCase):
 
 
 class MachineRule(unittest.TestCase):
-    """From season three the hill's machine is for challenges only: any other
-    job, or a session left to die of idleness, is named in the machine's
-    thread as a reminder. Challenges are never refused for it. The announcer
-    reads it from the machine's activity log; its own service jobs are exempt
-    by id."""
+    """From season three the hill's machine is for challenges only. Every long
+    run that is not a challenge (longer than machine_rule_job_seconds) and
+    every session left to die of idleness gets a reminder in the machine's
+    thread, each time. A quick look (ls, uname) is not a breach, challenges
+    are never refused for it, and the announcer's own service jobs are
+    exempt by id."""
 
     CMD = ('C=%s; curl -fsSLo hill.sh https://raw.githubusercontent.com/geibos/board-hill/$C/season3/hill.sh'
            ' && echo "%s  hill.sh" | sha256sum -c - && bash hill.sh challenge warriors/a.red' % ("1" * 40, "2" * 64))
@@ -1175,78 +1176,101 @@ class MachineRule(unittest.TestCase):
             x["job_id"] = job_id
         return x
 
+    def job(self, seq, at, actor, command, jid, seconds, num=7):
+        return [self.ev(seq, at, "job_submitted", actor, command, jid, "Submitted job #%d." % num),
+                self.ev(seq + 1, at + 1, "job_started", actor, None, jid),
+                self.ev(seq + 2, at + 1 + seconds, "job_finished", actor, None, jid)]
+
     def police(self, events, st=None, own=()):
         st = st if st is not None else {}
         with mock.patch("hill_king.activity", return_value=events), \
                 mock.patch("hill_king.own_jobs", return_value=set(own)):
-            new = hill_king.police(self.CFG, st)
-        return st, new
+            found = hill_king.police(self.CFG, st)
+        return st, found
 
-    def test_a_job_that_is_not_a_challenge_makes_a_violator(self):
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", "cd /workspace && bash hill.sh show", "j1")])
-        self.assertEqual(new, ["v"])
-        self.assertIn("v", st["machine_rule"]["3"]["bad"])
+    def who(self, found):
+        return [f[0] for f in found]
 
-    def test_the_seasons_challenge_is_allowed(self):
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", self.CMD, "j1")])
-        self.assertEqual(new, [])
+    def test_a_long_run_that_is_not_a_challenge_is_a_breach(self):
+        st, found = self.police(self.job(1, 2000, "v", "cd /data/workspace/eval && ./run.sh", "j1", 600, num=1108))
+        self.assertEqual(self.who(found), ["v"])
+        self.assertIn("№1108", found[0][2])
+        self.assertIn("10 мин", found[0][2])
+
+    def test_a_quick_look_is_not(self):
+        st, found = self.police(self.job(1, 2000, "v", "ls -la", "j1", 5))
+        self.assertEqual(found, [])
+
+    def test_a_long_challenge_is_fine(self):
+        st, found = self.police(self.job(1, 2000, "v", self.CMD, "j1", 900))
+        self.assertEqual(found, [])
 
     def test_the_announcers_own_service_jobs_are_exempt(self):
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "agent-board-sobieg", "cd /workspace/season3/hill && python3 -", "own1")],
-                              own={"own1"})
-        self.assertEqual(new, [])
+        st, found = self.police(self.job(1, 2000, "agent-board-sobieg", "cd /workspace && python3 -", "own1", 900),
+                                own={"own1"})
+        self.assertEqual(found, [])
 
-    def test_the_same_command_by_the_announcers_account_but_not_its_job_is_not(self):
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "agent-board-sobieg", "ls", "x")])
-        self.assertEqual(new, ["agent-board-sobieg"])
+    def test_the_announcers_account_is_not_exempt_for_other_jobs(self):
+        st, found = self.police(self.job(1, 2000, "agent-board-sobieg", "./bench.sh", "x", 900))
+        self.assertEqual(self.who(found), ["agent-board-sobieg"])
 
     def test_events_before_the_rule_do_not_count(self):
-        st, new = self.police([self.ev(1, 500, "job_submitted", "v", "ls", "j1")])
-        self.assertEqual(new, [])
+        st, found = self.police(self.job(1, 500, "v", "./bench.sh", "j1", 300))
+        self.assertEqual(found, [])
 
     def test_a_job_whose_command_is_hidden_is_not_judged(self):
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", None, "j1")])
-        self.assertEqual(new, [])
+        st, found = self.police(self.job(1, 2000, "v", None, "j1", 900))
+        self.assertEqual(found, [])
+
+    def test_a_job_finished_in_a_later_pass_is_still_judged(self):
+        events = self.job(1, 2000, "v", "./bench.sh", "j1", 900)
+        st, found = self.police(events[:2])
+        self.assertEqual(found, [])
+        st, found = self.police(events[2:], st)
+        self.assertEqual(self.who(found), ["v"])
+
+    def test_every_breach_is_reminded_not_just_the_first(self):
+        st, found = self.police(self.job(1, 2000, "v", "./bench.sh", "j1", 900))
+        st, found = self.police(self.job(10, 5000, "v", "./bench.sh", "j2", 900), st)
+        self.assertEqual(self.who(found), ["v"])
 
     def test_a_session_left_to_idle_is_on_who_released_it_last(self):
         events = [self.ev(1, 2000, "started", "a"), self.ev(2, 2001, "control_released", "a"),
                   self.ev(3, 2002, "control_acquired", "b"), self.ev(4, 2003, "control_released", "b"),
                   self.ev(5, 2700, "stopped", None, summary="Stopped (idle); 12 running minutes were accounted.")]
-        st, new = self.police(events)
-        self.assertEqual(new, ["b"])
+        st, found = self.police(events)
+        self.assertEqual(self.who(found), ["b"])
+        self.assertIn("12 мин", found[0][2])
 
     def test_a_stopped_session_is_fine(self):
         events = [self.ev(1, 2000, "started", "a"), self.ev(2, 2100, "stop_requested", "a"),
                   self.ev(3, 2101, "stopped", None, summary="Stopped (requested); 2 running minutes were accounted.")]
-        st, new = self.police(events)
-        self.assertEqual(new, [])
+        st, found = self.police(events)
+        self.assertEqual(found, [])
 
-    def test_a_violator_is_named_once(self):
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", "ls", "j1")])
-        st, new = self.police([self.ev(2, 2100, "job_submitted", "v", "ls", "j2")], st)
-        self.assertEqual(new, [])
-        self.assertEqual(st["machine_rule"]["3"]["bad"]["v"]["seq"], 1)
-
-    def test_a_violators_challenge_still_counts(self):
-        # The rule names violations; it never refuses a real challenge.
-        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", "ls", "j1")])
-        self.assertEqual(new, ["v"])
+    def test_a_breach_never_refuses_a_challenge(self):
+        st, found = self.police(self.job(1, 2000, "v", "./bench.sh", "j1", 900))
         with mock.patch("hill_king.author_in", return_value="v"):
             hill_king.owner_check(self.CFG, {"params": ""}, {"actor": {"name": "v"}, "submitted_at": 2500, "number": 7},
                                   "f", "w" * 16)
 
-    def test_the_notice_is_a_reminder_not_a_penalty(self):
+    def test_one_reminder_per_account_per_pass(self):
+        found = [("v", {"seq": 1, "at": 2000}, "задание №1 — не вызов, шло 10 мин"),
+                 ("v", {"seq": 5, "at": 2900}, "задание №2 — не вызов, шло 15 мин"),
+                 ("w", {"seq": 9, "at": 3000}, "сессию оставили гаснуть по простою: 12 мин")]
         sent = []
         with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append(doc) or {}):
-            hill_king.violation_notice(self.CFG, "v", {"seq": 1, "at": 2000, "why": "задание не вызов: `ls`"})
-        body = sent[0]["body"]
-        self.assertIn("зеркал", body)
-        self.assertNotIn("не засчитыва", body)
+            hill_king.remind(self.CFG, found)
+        self.assertEqual(len(sent), 2)
+        self.assertIn("№1", sent[0]["body"])
+        self.assertIn("№2", sent[0]["body"])
+        self.assertIn("зеркал", sent[0]["body"])
+        self.assertNotIn("не засчитыва", sent[0]["body"])
 
     def test_without_the_rule_nothing_is_policed(self):
         with mock.patch("hill_king.activity") as act:
-            new = hill_king.police(dict(self.CFG, machine_rule_from=None), {})
-        self.assertEqual(new, [])
+            found = hill_king.police(dict(self.CFG, machine_rule_from=None), {})
+        self.assertEqual(found, [])
         act.assert_not_called()
 
 
@@ -1262,13 +1286,19 @@ class NoInjection(unittest.TestCase):
             self.assertNotIn(bad, p)
         self.assertLessEqual(len(hill_king.plain("x" * 500)), 60)
 
-    def test_a_violation_names_the_job_not_its_command(self):
-        x = {"seq": 1, "at": 2000, "type": "job_submitted", "actor": "v", "job_id": "j1",
-             "summary": "Submitted job #269.", "detail": {"command": "echo @everyone **pwn**"}}
-        with mock.patch("hill_king.activity", return_value=[x]), mock.patch("hill_king.own_jobs", return_value=set()):
-            st = {}
-            hill_king.police(MachineRule.CFG, st)
-        why = st["machine_rule"]["3"]["bad"]["v"]["why"]
+    def test_a_link_cannot_be_reassembled_by_what_is_stripped(self):
+        for evil in ("ht@tp://evil.example/x", "h`ttps://evil.example", "http*s://evil.example",
+                     "w@ww.evil.example", "hthttp://tp://evil.example", "ww`w.evil.example"):
+            p = hill_king.plain(evil)
+            self.assertNotIn("://", p, evil)
+            self.assertNotIn("www.", p, evil)
+
+    def test_a_breach_names_the_job_not_its_command(self):
+        m = MachineRule()
+        events = m.job(1, 2000, "v", "echo @everyone **pwn**", "j1", 900, num=269)
+        with mock.patch("hill_king.activity", return_value=events), mock.patch("hill_king.own_jobs", return_value=set()):
+            found = hill_king.police(MachineRule.CFG, {})
+        why = found[0][2]
         self.assertIn("№269", why)
         self.assertNotIn("@everyone", why)
         self.assertNotIn("pwn", why)
