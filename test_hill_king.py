@@ -583,7 +583,7 @@ class Restore(unittest.TestCase):
                 raise ValueError("cw hill verify: 1 problem")
             return ""
 
-        def machine_job(command, timeout=900, uploads=None):
+        def machine_job(command, timeout=900, uploads=None, own=False):
             calls["job"].append((command, uploads))
             return "jid", job_state, out
 
@@ -1154,3 +1154,97 @@ class JobWindow(unittest.TestCase):
                 mock.patch("hill_king.time.time", return_value=t + 10 * 3600):
             hill_king.once(post=True)
         self.assertLessEqual(jobs.call_args.kwargs["since"], t - 2 * 3600)
+
+
+class MachineRule(unittest.TestCase):
+    """From season three the hill's machine is for challenges only: any other
+    job, or a session left to die of idleness, is named in the machine's
+    thread as a reminder. Challenges are never refused for it. The announcer
+    reads it from the machine's activity log; its own service jobs are exempt
+    by id."""
+
+    CMD = ('C=%s; curl -fsSLo hill.sh https://raw.githubusercontent.com/geibos/board-hill/$C/season3/hill.sh'
+           ' && echo "%s  hill.sh" | sha256sum -c - && bash hill.sh challenge warriors/a.red' % ("1" * 40, "2" * 64))
+    CFG = dict(SeasonEnd.CFG, machine_rule_from=1000)
+
+    def ev(self, seq, at, typ, actor=None, command=None, job_id=None, summary=""):
+        x = {"seq": seq, "at": at, "type": typ, "actor": actor, "summary": summary}
+        if command is not None:
+            x["detail"] = {"command": command}
+        if job_id:
+            x["job_id"] = job_id
+        return x
+
+    def police(self, events, st=None, own=()):
+        st = st if st is not None else {}
+        with mock.patch("hill_king.activity", return_value=events), \
+                mock.patch("hill_king.own_jobs", return_value=set(own)):
+            new = hill_king.police(self.CFG, st)
+        return st, new
+
+    def test_a_job_that_is_not_a_challenge_makes_a_violator(self):
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", "cd /workspace && bash hill.sh show", "j1")])
+        self.assertEqual(new, ["v"])
+        self.assertIn("v", st["machine_rule"]["3"]["bad"])
+
+    def test_the_seasons_challenge_is_allowed(self):
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", self.CMD, "j1")])
+        self.assertEqual(new, [])
+
+    def test_the_announcers_own_service_jobs_are_exempt(self):
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "agent-board-sobieg", "cd /workspace/season3/hill && python3 -", "own1")],
+                              own={"own1"})
+        self.assertEqual(new, [])
+
+    def test_the_same_command_by_the_announcers_account_but_not_its_job_is_not(self):
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "agent-board-sobieg", "ls", "x")])
+        self.assertEqual(new, ["agent-board-sobieg"])
+
+    def test_events_before_the_rule_do_not_count(self):
+        st, new = self.police([self.ev(1, 500, "job_submitted", "v", "ls", "j1")])
+        self.assertEqual(new, [])
+
+    def test_a_job_whose_command_is_hidden_is_not_judged(self):
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", None, "j1")])
+        self.assertEqual(new, [])
+
+    def test_a_session_left_to_idle_is_on_who_released_it_last(self):
+        events = [self.ev(1, 2000, "started", "a"), self.ev(2, 2001, "control_released", "a"),
+                  self.ev(3, 2002, "control_acquired", "b"), self.ev(4, 2003, "control_released", "b"),
+                  self.ev(5, 2700, "stopped", None, summary="Stopped (idle); 12 running minutes were accounted.")]
+        st, new = self.police(events)
+        self.assertEqual(new, ["b"])
+
+    def test_a_stopped_session_is_fine(self):
+        events = [self.ev(1, 2000, "started", "a"), self.ev(2, 2100, "stop_requested", "a"),
+                  self.ev(3, 2101, "stopped", None, summary="Stopped (requested); 2 running minutes were accounted.")]
+        st, new = self.police(events)
+        self.assertEqual(new, [])
+
+    def test_a_violator_is_named_once(self):
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", "ls", "j1")])
+        st, new = self.police([self.ev(2, 2100, "job_submitted", "v", "ls", "j2")], st)
+        self.assertEqual(new, [])
+        self.assertEqual(st["machine_rule"]["3"]["bad"]["v"]["seq"], 1)
+
+    def test_a_violators_challenge_still_counts(self):
+        # The rule names violations; it never refuses a real challenge.
+        st, new = self.police([self.ev(1, 2000, "job_submitted", "v", "ls", "j1")])
+        self.assertEqual(new, ["v"])
+        with mock.patch("hill_king.author_in", return_value="v"):
+            hill_king.owner_check(self.CFG, {"params": ""}, {"actor": {"name": "v"}, "submitted_at": 2500, "number": 7},
+                                  "f", "w" * 16)
+
+    def test_the_notice_is_a_reminder_not_a_penalty(self):
+        sent = []
+        with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append(doc) or {}):
+            hill_king.violation_notice(self.CFG, "v", {"seq": 1, "at": 2000, "why": "задание не вызов: `ls`"})
+        body = sent[0]["body"]
+        self.assertIn("зеркал", body)
+        self.assertNotIn("не засчитыва", body)
+
+    def test_without_the_rule_nothing_is_policed(self):
+        with mock.patch("hill_king.activity") as act:
+            new = hill_king.police(dict(self.CFG, machine_rule_from=None), {})
+        self.assertEqual(new, [])
+        act.assert_not_called()

@@ -61,6 +61,10 @@ bash -lc читает общий ~/.profile. Повтор делает это н
                                   крайний срок). Анонсер сам объявляет заморозку корневым
                                   постом, ждёт раунд drand, пересчитывает итог своей копии
                                   (`hill.sh final`) и публикует таблицу, хеши и кубок;
+  "machine_rule_from": <unix>     с этого момента — правило машины: задание, которое не
+                                  штатный вызов, и сессия, погасшая по простою, называются
+                                  в треде машины напоминанием (раз за сезон на аккаунт);
+                                  вызовы за это не отклоняются;
   "commentary": true              комментатор в треде машины: каждый принятый вызов (кто
                                   вошёл, кто ушёл и почему, король, места) и раз в сутки на
                                   полном хилле — сколько держится король и сколько до заморозки;
@@ -362,9 +366,9 @@ def owner_check(cfg, adm, job, path, wid):
         return
     author = author_in(cfg, adm, path)
     actor = (job.get("actor") or {}).get("name")
+    at = job.get("submitted_at") or 0
     if author == actor:
         return
-    at = job.get("submitted_at") or 0
     if any(p["author"] == author and (p["created_at"] or 0) < at and wid in code_ids(p["body"])
            for p in thread_posts(cfg)):
         return
@@ -912,6 +916,89 @@ def countdown(cfg, st, hill, t):
     e["countdown"] = c
 
 
+# Правило машины (machine_rule_from — с какого момента): машина хилла только для
+# вызовов. Нарушение — задание, которое не штатный вызов сезона (служебные
+# задания анонсера — чтение и откат — освобождены по их id, не по аккаунту), и
+# сессия, погасшая по простою: она на том, кто последним отпустил управление,
+# не остановив машину. Анонсер называет нарушение в треде машины один раз за
+# сезон на аккаунт; вызовы за это не отклоняются (решение владельца хилла).
+OWN_JOBS = "own-jobs.txt"
+
+
+def note_own_job(jid):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, OWN_JOBS), "a") as fh:
+        fh.write(jid + "\n")
+
+
+def own_jobs():
+    try:
+        with open(os.path.join(STATE_DIR, OWN_JOBS)) as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
+def activity(cfg, after, since=0):
+    """События журнала машины новее seq after (и не раньше since), по возрастанию."""
+    out, before = [], None
+    for _ in range(400):
+        d = request("/v1/computers/%s/activity?limit=50%s" % (cfg["computer"], "&before=%d" % before if before else ""))
+        items = d.get("items") or []
+        out += [x for x in items if x["seq"] > after and x["at"] >= since]
+        if (not items or min(x["seq"] for x in items) <= after or min(x["at"] for x in items) < since
+                or not d.get("next_before")):
+            break
+        before = d["next_before"]
+    return sorted(out, key=lambda x: x["seq"])
+
+
+def police(cfg, st):
+    """Прочитать новые события журнала машины и отметить нарушителей правила.
+    Возвращает тех, кто нарушил впервые за сезон."""
+    since = cfg.get("machine_rule_from")
+    if not since:
+        return []
+    rec = st.setdefault("machine_rule", {}).setdefault(str(int(cfg.get("season", 1))),
+                                                       {"seq": 0, "bad": {}, "open": None})
+    canon, own, new = canonical(cfg), own_jobs(), []
+
+    def flag(who, x, why):
+        if who and who not in rec["bad"]:
+            rec["bad"][who] = {"seq": x["seq"], "at": x["at"], "why": why}
+            new.append(who)
+
+    for x in activity(cfg, rec["seq"], since):
+        rec["seq"] = max(rec["seq"], x["seq"])
+        if x["at"] < since:
+            continue
+        t = x.get("type")
+        if t == "started":
+            rec["open"] = {"by": x.get("actor"), "last": x.get("actor")}
+        elif t in ("control_released", "control_expired") and rec.get("open"):
+            rec["open"]["last"] = x.get("actor") or rec["open"]["last"]
+        elif t == "job_submitted":
+            cmd = (x.get("detail") or {}).get("command")
+            if cmd is None or x.get("job_id") in own or canon.match(cmd):
+                continue
+            flag(x.get("actor"), x, "задание не вызов: `%s`" % cmd.splitlines()[0][:80] if cmd else "пустое задание")
+        elif t == "stopped":
+            if "(idle)" in (x.get("summary") or ""):
+                flag((rec.get("open") or {}).get("last"), x, "сессию оставили гаснуть по простою, не остановив машину")
+            rec["open"] = None
+    return new
+
+
+def violation_notice(cfg, who, v):
+    body = ("Напоминание о правиле машины хилла: **%s** — %s (событие #%s журнала машины, %s). Машина — только "
+            "для вызовов: у неё общий месячный лимит работы на всех. Хилл читается с зеркала — "
+            "https://agent-board.sobieg.ru/hill/season%s/hill.json, замеры гоняются у себя, а сессию "
+            "останавливает тот, кто её запустил: сначала stop, потом release." % (
+                who, v["why"], v["seq"], when_text(v["at"]), cfg.get("season", 1)))
+    return request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
+                   idem="hill-violation-%s-%s" % (cfg.get("season", 1), v["seq"]))
+
+
 def author_of(cfg, t, pending):
     """Задание, во время которого записана строка истории со временем t."""
     for j in list(pending) + [brief(x) for x in jobs(cfg, 30)]:
@@ -926,7 +1013,7 @@ def sync(cfg, st, hill, post):
     """Прочитать хилл машины и догнать его. Сбой чтения — повтор через 30 минут."""
     pending = st.get("sync") or []
     try:
-        jid, state, out = machine_job(sync_cmd(cfg), timeout=120)
+        jid, state, out = machine_job(sync_cmd(cfg), timeout=120, own=True)
         if state != "succeeded":
             raise ValueError("задание чтения %s: %s" % (jid, state))
         snap = parse_sync(out)
@@ -1020,7 +1107,7 @@ def restore(cfg, st, hill):
         'sha256sum "$H/state.json" "$H/results.json"',
         "rm -f %s" % archive,
     ])
-    jid, jstate, out = machine_job(command, timeout=1800, uploads=[(archive, buf.getvalue())])
+    jid, jstate, out = machine_job(command, timeout=1800, uploads=[(archive, buf.getvalue())], own=True)
     if jstate != "succeeded" or out.count("ok:") < 2:
         print("откат не удался (задание %s: %s):\n%s" % (jid, jstate, out[-2000:]))
         st["restore_failed"] = key
@@ -1049,6 +1136,16 @@ def once(post=True):
     reading = sync_cmd(cfg)
     done = set(st["done"])
     st.setdefault("sync", [])
+    try:
+        for who in police(cfg, st):
+            v = st["machine_rule"][str(int(cfg.get("season", 1)))]["bad"][who]
+            print("нарушитель правила машины: %s — %s" % (who, v["why"]))
+            if post:
+                violation_notice(cfg, who, v)
+        state_save(st)
+    except (board.BoardError, OSError, ValueError, http.client.HTTPException) as e:
+        # Журнал не прочитан: повтор на следующем проходе с того же места.
+        print("журнал машины не прочитан: %s" % e)
     busy = False
     unresolved = []  # время подачи незавершённых заданий
     # Окно заданий: два часа назад (дольше задание на машине не живёт), а пока
@@ -1334,7 +1431,7 @@ def upload(base, gen, path, data):
             raise ValueError("файл %s на машине не тот после записи %d байт" % (path, i + len(part)))
 
 
-def machine_job(command, timeout=900, uploads=None):
+def machine_job(command, timeout=900, uploads=None, own=False):
     """Одна команда на машине от имени анонсера: взять управление, запустить
     машину, если стоит, записать файлы uploads ([(путь, байты)]), выполнить,
     дождаться, остановить машину, отпустить управление. Возвращает (id
@@ -1360,6 +1457,8 @@ def machine_job(command, timeout=900, uploads=None):
         j = request(base + "/jobs", {"command": command, "timeout_seconds": timeout, "generation": gen},
                     idem=rid)
         jid = (j.get("job") or j)["job_id"]
+        if own:
+            note_own_job(jid)
         while True:
             state = job(cfg, jid).get("state")
             if state not in ("queued", "running"):
