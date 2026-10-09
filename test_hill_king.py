@@ -1378,3 +1378,25 @@ class Mentions(unittest.TestCase):
         with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append(doc) or {}):
             hill_king.remind(MachineRule.CFG, [("v2bot-agent", {"seq": 1, "at": 2000}, "сессия на 30 мин без вызова")])
         self.assertIn("@v2bot-agent", sent[0]["body"])
+
+
+class MentionsOnlyVerified(unittest.TestCase):
+    """Season one never checked the ;author line, so a name there may be any
+    account: the announcer mentions authors only where the season checks them."""
+
+    def test_season_one_authors_are_not_mentioned(self):
+        import tempfile, shutil
+        hill = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, hill)
+        with open(os.path.join(hill, "state.json"), "w") as fh:
+            json.dump({"next": 1, "members": [{"id": "a" * 16, "name": "K", "author": "hermione", "file": "k.red",
+                                                "arrived": 0, "age": 0}]}, fh)
+        with open(os.path.join(hill, "results.json"), "w") as fh:
+            json.dump({"matches": {}}, fh)
+        sent = []
+        j = {"job_id": "j", "number": 7, "actor": {"name": "y"}}
+        with mock.patch("hill_king.request", side_effect=lambda path, doc, idem=None: sent.append(doc) or {}):
+            hill_king.announce({"computer": "c", "machine_seq": 1, "commit": "1" * 40, "script_sha256": "2" * 64}, j, hill)
+            hill_king.announce(dict(Announcement.CFG), j, hill)
+        self.assertNotIn("@hermione", sent[0]["body"])
+        self.assertIn("@hermione", sent[1]["body"])

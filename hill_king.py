@@ -512,14 +512,22 @@ def mention(name):
     return "@" + name if ACCOUNT.fullmatch(name) else plain(name)
 
 
+def author_ref(cfg, name):
+    """Автор бойца в посте: упоминание только там, где сезон проверяет ;author
+    (со второго: автор — тот, кто бросил вызов, или выложил исходник в тред).
+    В первом сезоне строка ;author могла назвать любой аккаунт."""
+    return mention(name) if int(cfg.get("season", 1)) >= 2 else plain(name)
+
+
 def code_line(s):
     """Строка таблицы внутри блока кода: без обратных кавычек и @."""
     return re.sub(r"[`@]", "", s)
 
 
-def table(state_path, rows=5):
+def table(state_path, rows=5, cfg=None):
     st = load(state_path)["members"]
-    return "\n".join("%d. %s — %s" % (i + 1, plain(m["name"]), mention(m["author"])) for i, m in enumerate(st[:rows]))
+    return "\n".join("%d. %s — %s" % (i + 1, plain(m["name"]), author_ref(cfg or {}, m["author"]))
+                     for i, m in enumerate(st[:rows]))
 
 
 SEASON_OF = {2: "второго", 3: "третьего", 4: "четвёртого", 5: "пятого", 6: "шестого", 7: "седьмого",
@@ -604,7 +612,7 @@ def announce(cfg, j, hill, prev=None):
             lead, plural(lead, "очко", "очка", "очков"), sc[king["id"]], sc[st[1]["id"]], plain(st[1]["name"]))
     if prev:
         facts += "Прежний король — %s (%s): на вершине выдержал %d %s.\n" % (
-            plain(prev["name"]), mention(prev["author"]), prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
+            plain(prev["name"]), author_ref(cfg, prev["author"]), prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
     body = (
         "На хилле Core War новый король" + of_season + ": **%s** (%s).\n\n"
         "Вызов бросил %s (задание №%s на машине хилла, пост #%s).\n\n"
@@ -612,8 +620,8 @@ def announce(cfg, j, hill, prev=None):
         "Верх таблицы:\n%s\n\n"
         "Этот прогон повторён независимо на сервере зеркала: состав, порядок и все матчи совпали. "
         "Проверить самому: `bash hill.sh verify` на машине.\n\n%s"
-        % (plain(king["name"]), mention(king["author"]), actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
-           facts + "\n" if facts else "", table(os.path.join(hill, "state.json")), how_to(cfg))
+        % (plain(king["name"]), author_ref(cfg, king["author"]), actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
+           facts + "\n" if facts else "", table(os.path.join(hill, "state.json"), cfg=cfg), how_to(cfg))
     )
     title = "Новый король хилла Core War%s: %s" % ("" if season == 1 else ", сезон %d" % season, plain(king["name"]))
     return request("/v1/posts", {"title": title[:160], "body": body, "topic": cfg.get("topic", "general")},
@@ -755,7 +763,7 @@ def freeze_notice(cfg, st, hill, t, why, rnd):
         reign = st.get("reign") or {}
         cause = ("хилл полон (%d из %d) с %s, король **%s** (%s) не менялся с %s — %s часов, считая не "
                  "раньше заполнения" % (len(members), hill_size(hill), when_text(e["full_at"]), plain(members[0]["name"]),
-                                        mention(members[0]["author"]), when_text(reign.get("at") or e["full_at"]),
+                                        author_ref(cfg, members[0]["author"]), when_text(reign.get("at") or e["full_at"]),
                                         cfg["hold_hours"]))
     else:
         cause = "наступил крайний срок сезона"
@@ -766,7 +774,7 @@ def freeze_notice(cfg, st, hill, t, why, rnd):
             "раунда **%d** (%s) — первого строго после заморозки. Анонсер посчитает итог сам, как только "
             "значение выйдет, и опубликует таблицу, хеши и кубок партий. Проверить может каждый: "
             "`bash hill.sh final %d` на снимке хилла." % (
-                season_is(cfg), when_text(t), cause, table(os.path.join(hill, "state.json"), rows=len(members)),
+                season_is(cfg), when_text(t), cause, table(os.path.join(hill, "state.json"), rows=len(members), cfg=cfg),
                 "32", rnd, when_text(round_time(rnd)), rnd))
     title = "Хилл Core War: %s сезон заморожен" % season_is(cfg)
     return request("/v1/posts", {"title": title[:160], "body": body, "topic": cfg.get("topic", "general")},
@@ -897,21 +905,21 @@ def comment(cfg, st, hill, old, new, j, crowned, when):
         why = {g.get("id"): g.get("reason") for g in last.get("pushed_off") or []}
     except (OSError, IndexError, ValueError):
         pass
-    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (plain(m["name"]), mention(m["author"]), place[m["id"]], sc[m["id"]])
+    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (plain(m["name"]), author_ref(cfg, m["author"]), place[m["id"]], sc[m["id"]])
              for m in entered]
-    lines += ["Уходит **%s** (%s): %s." % (plain(m["name"]), mention(m["author"]), gone_reason(why.get(m["id"]))) for m in left]
+    lines += ["Уходит **%s** (%s): %s." % (plain(m["name"]), author_ref(cfg, m["author"]), gone_reason(why.get(m["id"]))) for m in left]
     k = new["members"][0]
     size, n = hill_size(hill), len(new["members"])
     t, reason = freeze_of(cfg, st)
     full_at = ends(cfg, st).get("full_at")
     if crowned:
         lines.append("Новый король — **%s** (%s), %d %s%s." % (
-            plain(k["name"]), mention(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
+            plain(k["name"]), author_ref(cfg, k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
             "; отсчёт %s часов начинается заново" % cfg["hold_hours"] if cfg.get("hold_hours") and full_at else ""))
     else:
         lead = sc[k["id"]] - sc[new["members"][1]["id"]] if n > 1 else sc[k["id"]]
         lines.append("Король прежний — **%s** (%s), %d %s, отрыв от второго %d." % (
-            plain(k["name"]), mention(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
+            plain(k["name"]), author_ref(cfg, k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
     if size and n >= size and full_at == when:
         lines.append("Хилл заполнен: %d из %d. Пошёл отсчёт: если король продержится %s часов, сезон замёрзнет "
                      "(%s)." % (n, size, cfg.get("hold_hours"), when_text(t)) if cfg.get("hold_hours") and t
@@ -941,7 +949,7 @@ def countdown(cfg, st, hill, t):
         k = load(os.path.join(hill, "state.json"))["members"][0]
         body = ("Сутки %d: король **%s** (%s) держится на полном хилле %d ч из %s. Если его никто не свергнет, "
                 "сезон замёрзнет %s — осталось %d ч." % (
-                    days, plain(k["name"]), mention(k["author"]), int((now - start) // 3600), cfg["hold_hours"], when_text(t),
+                    days, plain(k["name"]), author_ref(cfg, k["author"]), int((now - start) // 3600), cfg["hold_hours"], when_text(t),
                     max(0, int((t - now) // 3600))))
         request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
                 idem="hill-countdown-%s-%d-%d" % (cfg.get("season", 1), start, days))
