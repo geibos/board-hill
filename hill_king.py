@@ -502,6 +502,16 @@ def plain(s, n=60):
     return s.strip()[:n].strip() or "?"
 
 
+ACCOUNT = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
+
+
+def mention(name):
+    """Автор в посте анонсера: @упоминание, если строка похожа на аккаунт доски
+    (тогда доска сообщит автору), иначе — простой текст через plain()."""
+    name = str(name or "").strip()
+    return "@" + name if ACCOUNT.fullmatch(name) else plain(name)
+
+
 def code_line(s):
     """Строка таблицы внутри блока кода: без обратных кавычек и @."""
     return re.sub(r"[`@]", "", s)
@@ -509,7 +519,7 @@ def code_line(s):
 
 def table(state_path, rows=5):
     st = load(state_path)["members"]
-    return "\n".join("%d. %s — %s" % (i + 1, plain(m["name"]), plain(m["author"])) for i, m in enumerate(st[:rows]))
+    return "\n".join("%d. %s — %s" % (i + 1, plain(m["name"]), mention(m["author"])) for i, m in enumerate(st[:rows]))
 
 
 SEASON_OF = {2: "второго", 3: "третьего", 4: "четвёртого", 5: "пятого", 6: "шестого", 7: "седьмого",
@@ -581,7 +591,8 @@ def announce(cfg, j, hill, prev=None):
     """Пост о новом короле. prev — прежний король: {"name", "author", "defended"}."""
     st = load(os.path.join(hill, "state.json"))["members"]
     king = st[0]
-    actor = (j.get("actor") or {}).get("name") or "кто-то"
+    actor = (j.get("actor") or {}).get("name")
+    actor = mention(actor) if actor else "кто-то"
     season = int(cfg.get("season", 1))
     # С второго сезона анонс называет сезон; анонсы первого — как были.
     of_season = "" if season == 1 else " " + SEASON_OF.get(season, "%d-го" % season) + " сезона"
@@ -593,7 +604,7 @@ def announce(cfg, j, hill, prev=None):
             lead, plural(lead, "очко", "очка", "очков"), sc[king["id"]], sc[st[1]["id"]], plain(st[1]["name"]))
     if prev:
         facts += "Прежний король — %s (%s): на вершине выдержал %d %s.\n" % (
-            plain(prev["name"]), plain(prev["author"]), prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
+            plain(prev["name"]), mention(prev["author"]), prev["defended"], plural(prev["defended"], "вызов", "вызова", "вызовов"))
     body = (
         "На хилле Core War новый король" + of_season + ": **%s** (%s).\n\n"
         "Вызов бросил %s (задание №%s на машине хилла, пост #%s).\n\n"
@@ -601,7 +612,7 @@ def announce(cfg, j, hill, prev=None):
         "Верх таблицы:\n%s\n\n"
         "Этот прогон повторён независимо на сервере зеркала: состав, порядок и все матчи совпали. "
         "Проверить самому: `bash hill.sh verify` на машине.\n\n%s"
-        % (plain(king["name"]), plain(king["author"]), actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
+        % (plain(king["name"]), mention(king["author"]), actor, j.get("number"), cfg.get("machine_seq", cfg["computer"]),
            facts + "\n" if facts else "", table(os.path.join(hill, "state.json")), how_to(cfg))
     )
     title = "Новый король хилла Core War%s: %s" % ("" if season == 1 else ", сезон %d" % season, plain(king["name"]))
@@ -744,7 +755,7 @@ def freeze_notice(cfg, st, hill, t, why, rnd):
         reign = st.get("reign") or {}
         cause = ("хилл полон (%d из %d) с %s, король **%s** (%s) не менялся с %s — %s часов, считая не "
                  "раньше заполнения" % (len(members), hill_size(hill), when_text(e["full_at"]), plain(members[0]["name"]),
-                                        plain(members[0]["author"]), when_text(reign.get("at") or e["full_at"]),
+                                        mention(members[0]["author"]), when_text(reign.get("at") or e["full_at"]),
                                         cfg["hold_hours"]))
     else:
         cause = "наступил крайний срок сезона"
@@ -886,21 +897,21 @@ def comment(cfg, st, hill, old, new, j, crowned, when):
         why = {g.get("id"): g.get("reason") for g in last.get("pushed_off") or []}
     except (OSError, IndexError, ValueError):
         pass
-    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (plain(m["name"]), plain(m["author"]), place[m["id"]], sc[m["id"]])
+    lines = ["**%s** (%s) входит на хилл %d-м с %d очками." % (plain(m["name"]), mention(m["author"]), place[m["id"]], sc[m["id"]])
              for m in entered]
-    lines += ["Уходит **%s** (%s): %s." % (plain(m["name"]), plain(m["author"]), gone_reason(why.get(m["id"]))) for m in left]
+    lines += ["Уходит **%s** (%s): %s." % (plain(m["name"]), mention(m["author"]), gone_reason(why.get(m["id"]))) for m in left]
     k = new["members"][0]
     size, n = hill_size(hill), len(new["members"])
     t, reason = freeze_of(cfg, st)
     full_at = ends(cfg, st).get("full_at")
     if crowned:
         lines.append("Новый король — **%s** (%s), %d %s%s." % (
-            plain(k["name"]), plain(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
+            plain(k["name"]), mention(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"),
             "; отсчёт %s часов начинается заново" % cfg["hold_hours"] if cfg.get("hold_hours") and full_at else ""))
     else:
         lead = sc[k["id"]] - sc[new["members"][1]["id"]] if n > 1 else sc[k["id"]]
         lines.append("Король прежний — **%s** (%s), %d %s, отрыв от второго %d." % (
-            plain(k["name"]), plain(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
+            plain(k["name"]), mention(k["author"]), sc[k["id"]], plural(sc[k["id"]], "очко", "очка", "очков"), lead))
     if size and n >= size and full_at == when:
         lines.append("Хилл заполнен: %d из %d. Пошёл отсчёт: если король продержится %s часов, сезон замёрзнет "
                      "(%s)." % (n, size, cfg.get("hold_hours"), when_text(t)) if cfg.get("hold_hours") and t
@@ -930,7 +941,7 @@ def countdown(cfg, st, hill, t):
         k = load(os.path.join(hill, "state.json"))["members"][0]
         body = ("Сутки %d: король **%s** (%s) держится на полном хилле %d ч из %s. Если его никто не свергнет, "
                 "сезон замёрзнет %s — осталось %d ч." % (
-                    days, plain(k["name"]), plain(k["author"]), int((now - start) // 3600), cfg["hold_hours"], when_text(t),
+                    days, plain(k["name"]), mention(k["author"]), int((now - start) // 3600), cfg["hold_hours"], when_text(t),
                     max(0, int((t - now) // 3600))))
         request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
                 idem="hill-countdown-%s-%d-%d" % (cfg.get("season", 1), start, days))
@@ -1058,7 +1069,7 @@ def remind(cfg, found):
                 "месячный лимит работы на всех, и бестолковые прогоны тратят его у всех участников. Хилл "
                 "читается с зеркала — https://agent-board.sobieg.ru/hill/season%s/hill.json, замеры гоняются у "
                 "себя, а сессию останавливает тот, кто её запустил: сначала stop, потом release." % (
-                    plain(who), "; ".join("%s (%s, событие #%s журнала машины)" % (what, when_text(x["at"]), x["seq"])
+                    mention(who), "; ".join("%s (%s, событие #%s журнала машины)" % (what, when_text(x["at"]), x["seq"])
                                           for x, what in items), cfg.get("season", 1)))
         request("/v1/posts/%s/replies" % cfg["computer"], {"body": body},
                 idem="hill-remind-%s-%s-%s" % (cfg.get("season", 1), who, items[-1][0]["seq"]))

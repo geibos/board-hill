@@ -745,7 +745,7 @@ class Announcement(unittest.TestCase):
 
     def test_how_many_challenges_the_old_king_held(self):
         b = self.body(prev={"name": "Old", "author": "y", "defended": 2})
-        self.assertIn("Прежний король — Old (y): на вершине выдержал 2 вызова.", b)
+        self.assertIn("Прежний король — Old (@y): на вершине выдержал 2 вызова.", b)
         self.assertNotIn("Прежний король", self.body())
 
     def test_how_to_add_a_warrior_with_the_seasons_own_command(self):
@@ -982,7 +982,7 @@ class Commentary(unittest.TestCase):
                         matches={self.A + ":" + self.B: {"w1": 100, "w2": 50, "ties": 359}})
         out = self.take(st, old, new)
         self.assertEqual(len(out), 1)
-        self.assertIn("**Beta** (y)", out[0])
+        self.assertIn("**Beta** (@y)", out[0])
         self.assertIn("2-м", out[0])
         self.assertIn("509", out[0])  # Beta: 3*50 + 359
         self.assertIn("2 из 3", out[0])
@@ -1352,3 +1352,29 @@ class NoInjection(unittest.TestCase):
         self.assertNotIn("@everyone", out[0])
         self.assertNotIn("http://", out[0])
         self.assertEqual(out[0].count("\n"), 0)
+
+
+class Mentions(unittest.TestCase):
+    """Authors are mentioned, so the board tells them; only a name shaped like
+    an account becomes a mention, anything else stays plain text."""
+
+    def test_an_account_name_is_mentioned(self):
+        self.assertEqual(hill_king.mention("v2bot-agent"), "@v2bot-agent")
+
+    def test_anything_else_is_not(self):
+        for evil in ("everyone here", "Evil**", "@everyone [x](http://e.vil)", "a b", "", "X"):
+            self.assertNotIn("@", hill_king.mention(evil), evil)
+
+    def test_a_comment_mentions_the_authors(self):
+        c = Commentary()
+        old = Commentary.hill(c, [("a" * 16, "Alpha", "x")], 3)
+        new = Commentary.hill(c, [("a" * 16, "Alpha", "x"), ("b" * 16, "Beta", "y")], 3)
+        out = Commentary.take(c, {"done": [], "king": "a" * 16}, old, new)
+        self.assertIn("**Beta** (@y)", out[0])
+        self.assertIn("(@x)", out[0])
+
+    def test_a_reminder_mentions_the_account(self):
+        sent = []
+        with mock.patch("hill_king.request", side_effect=lambda path, doc=None, idem=None: sent.append(doc) or {}):
+            hill_king.remind(MachineRule.CFG, [("v2bot-agent", {"seq": 1, "at": 2000}, "сессия на 30 мин без вызова")])
+        self.assertIn("@v2bot-agent", sent[0]["body"])
