@@ -1248,6 +1248,46 @@ class MachineRule(unittest.TestCase):
         st, found = self.police(events)
         self.assertEqual(found, [])
 
+    def session(self, seq, at, actor, minutes, jobs=(), why="requested"):
+        ev = [self.ev(seq, at, "started", actor)]
+        k = seq + 1
+        for command, seconds in jobs:
+            ev += self.job(k, at + 5 + k, actor, command, "j%d" % k, seconds)
+            k += 3
+        ev += [self.ev(k, at + minutes * 60 - 2, "control_released", actor),
+               self.ev(k + 1, at + minutes * 60, "stopped", None,
+                       summary="Stopped (%s); %d running minutes were accounted." % (why, minutes))]
+        return ev
+
+    def test_a_long_session_without_a_challenge_is_a_breach_even_with_quick_jobs(self):
+        # A long run started in the background by a quick job, then stopped properly.
+        st, found = self.police(self.session(1, 2000, "v", 30, jobs=[("nohup ./bench.sh &", 2), ("tail log", 3)]))
+        self.assertEqual(self.who(found), ["v"])
+        self.assertIn("30 мин", found[0][2])
+        self.assertIn("без вызова", found[0][2])
+
+    def test_a_long_session_with_a_challenge_is_fine(self):
+        st, found = self.police(self.session(1, 2000, "v", 30, jobs=[(self.CMD, 60)]))
+        self.assertEqual(found, [])
+
+    def test_a_short_session_without_a_challenge_is_fine(self):
+        st, found = self.police(self.session(1, 2000, "v", 3, jobs=[("ls", 2)]))
+        self.assertEqual(found, [])
+
+    def test_a_long_job_and_its_session_are_one_breach(self):
+        st, found = self.police(self.session(1, 2000, "v", 30, jobs=[("./bench.sh", 1500)]))
+        self.assertEqual(len(found), 1)
+
+    def test_a_job_with_no_finish_is_judged_at_the_stop(self):
+        ev = [self.ev(1, 2000, "started", "v"),
+              self.ev(2, 2001, "job_submitted", "v", "./bench.sh", "j1", "Submitted job #5."),
+              self.ev(3, 2002, "job_started", "v", None, "j1"),
+              self.ev(4, 2002 + 200, "stop_requested", "v"),
+              self.ev(5, 2002 + 205, "stopped", None, summary="Stopped (requested); 4 running minutes were accounted.")]
+        st, found = self.police(ev)
+        self.assertEqual(self.who(found), ["v"])
+        self.assertIn("№5", found[0][2])
+
     def test_a_breach_never_refuses_a_challenge(self):
         st, found = self.police(self.job(1, 2000, "v", "./bench.sh", "j1", 900))
         with mock.patch("hill_king.author_in", return_value="v"):

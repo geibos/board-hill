@@ -64,7 +64,9 @@ bash -lc читает общий ~/.profile. Повтор делает это н
   "machine_rule_from": <unix>     с этого момента — правило машины: каждое задание, которое
                                   не штатный вызов и шло дольше machine_rule_job_seconds
                                   (по умолчанию 120), и каждая сессия, погасшая по простою,
-                                  — напоминание в треде машины; вызовы не отклоняются;
+                                  и каждая сессия дольше machine_rule_session_seconds (600)
+                                  без единого вызова — напоминание в треде машины; вызовы
+                                  не отклоняются;
   "commentary": true              комментатор в треде машины: каждый принятый вызов (кто
                                   вошёл, кто ушёл и почему, король, места) и раз в сутки на
                                   полном хилле — сколько держится король и сколько до заморозки;
@@ -978,28 +980,44 @@ def activity(cfg, after, since=0):
 def police(cfg, st):
     """Прочитать новые события журнала машины и найти нарушения правила: каждое
     задание, которое не вызов и шло дольше machine_rule_job_seconds (по
-    умолчанию 120 с), и каждую сессию, оставленную гаснуть по простою.
+    умолчанию 120 с), каждую сессию, оставленную гаснуть по простою, и каждую
+    сессию дольше machine_rule_session_seconds (600 с) без единого вызова — так
+    видно и долгий прогон, запущенный фоном короткими заданиями.
     Возвращает [(аккаунт, событие, что случилось)] — по каждому нарушению."""
     since = cfg.get("machine_rule_from")
     if not since:
         return []
     limit = int(cfg.get("machine_rule_job_seconds", 120))
+    session_limit = int(cfg.get("machine_rule_session_seconds", 600))
     rec = st.setdefault("machine_rule", {}).setdefault(str(int(cfg.get("season", 1))), {"seq": 0})
     rec.setdefault("open", None)
     pend = rec.setdefault("jobs", {})
     canon, own, found = canonical(cfg), own_jobs(), []
+
+    def long_job(j, x):
+        took = x["at"] - j["at"]
+        if took >= limit:
+            found.append((j["actor"], x, "задание %s — не вызов, шло %d мин" % (
+                "№" + j["num"] if j["num"] else "на машине", max(1, round(took / 60)))))
+            if rec.get("open"):
+                rec["open"]["told"] = True
+
     for x in activity(cfg, rec["seq"], since):
         rec["seq"] = max(rec["seq"], x["seq"])
         if x["at"] < since:
             continue
         t, jid = x.get("type"), x.get("job_id")
         if t == "started":
-            rec["open"] = {"by": x.get("actor"), "last": x.get("actor")}
+            rec["open"] = {"by": x.get("actor"), "last": x.get("actor"), "ok": False, "told": False}
         elif t in ("control_released", "control_expired") and rec.get("open"):
             rec["open"]["last"] = x.get("actor") or rec["open"]["last"]
         elif t == "job_submitted" and jid:
             cmd = (x.get("detail") or {}).get("command")
-            if cmd is None or jid in own or canon.match(cmd):
+            if cmd is None:
+                continue
+            if jid in own or canon.match(cmd):
+                if rec.get("open"):
+                    rec["open"]["ok"] = True
                 continue
             # Номер задания, а не текст команды: чужой текст в посте анонсера —
             # это чужая разметка, ссылки и упоминания от нашего имени.
@@ -1007,17 +1025,24 @@ def police(cfg, st):
             pend[jid] = {"actor": x.get("actor"), "num": num.group(1) if num else None, "at": x["at"]}
         elif t == "job_started" and jid in pend:
             pend[jid]["at"] = x["at"]
+            pend[jid]["started"] = True
         elif t == "job_finished" and jid in pend:
-            j = pend.pop(jid)
-            took = x["at"] - j["at"]
-            if took >= limit:
-                found.append((j["actor"], x, "задание %s — не вызов, шло %d мин" % (
-                    "№" + j["num"] if j["num"] else "на машине", max(1, round(took / 60)))))
+            long_job(pend.pop(jid), x)
         elif t == "stopped":
-            if "(idle)" in (x.get("summary") or "") and (rec.get("open") or {}).get("last"):
-                m = re.search(r"(\d+) running minutes", x.get("summary") or "")
-                found.append((rec["open"]["last"], x, "сессию оставили гаснуть по простою, не остановив машину: "
-                              "%s мин работы впустую" % (m.group(1) if m else "несколько")))
+            # Задание без события конца (оборвалось на остановке) — по остановке.
+            for k in list(pend):
+                if pend[k].get("started"):
+                    long_job(pend.pop(k), x)
+            o = rec.get("open") or {}
+            m = re.search(r"(\d+) running minutes", x.get("summary") or "")
+            minutes = int(m.group(1)) if m else 0
+            if "(idle)" in (x.get("summary") or "") and o.get("last"):
+                found.append((o["last"], x, "сессию оставили гаснуть по простою, не остановив машину: "
+                              "%s мин работы впустую" % (minutes or "несколько")))
+            elif o and not o.get("ok") and not o.get("told") and minutes * 60 >= session_limit:
+                # Долгий прогон, запущенный фоном короткими заданиями: сессия без
+                # единого вызова.
+                found.append((o.get("last") or o.get("by"), x, "сессия на %d мин без вызова" % minutes))
             rec["open"] = None
     return found
 
